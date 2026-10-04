@@ -140,3 +140,5 @@ def to_canvas(word: np.ndarray, width: int = 144) -> np.ndarray:
     already normalised, so only width is resampled."""
     img = cv2.resize(word, (width, word.shape[0]), interpolation=cv2.INTER_AREA)
     return cv2.GaussianBlur(img, (3, 3), 0.8)
+
+
