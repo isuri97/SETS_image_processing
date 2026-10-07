@@ -12,8 +12,7 @@ Label-free improvements to HOG word matching.
    of whitened vectors equals the score of the closed-form "exemplar LDA"
    classifier of Hariharan et al. (2012), used for word spotting by
    Almazan et al. (2012).
-
-2. HOG-DTW
+   HOG-DTW
    HOG is computed on the normalised word image and read off as a sequence
    of block-columns (left to right). Sequences are reduced with PCA (fitted
    on both pages) and aligned with DTW, combining HOG's local gradient
