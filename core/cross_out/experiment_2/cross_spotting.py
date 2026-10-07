@@ -82,12 +82,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from segment_manuscript import Box, Params, _runs, binarise, group_palette, segment
-from handwriting_norm import NormParams, normalise_word, to_canvas
+from core.segment_manuscript import Box, Params, _runs, binarise, group_palette, segment
+from core.handwriting_norm import NormParams, normalise_word, to_canvas
 from hog_plus import (HogPlusParams, hog_column_sequence, project_sequences,
                       whitened_hog)
-from profile_dtw import column_features, dtw_matrix
-from core.cross_out.word_spotting import SpotParams, compute_hog, tighten_to_ink
+from core.profile_dtw import column_features, dtw_matrix
+from core.word_spotting import SpotParams, compute_hog, tighten_to_ink
 
 
 # --------------------------------------------------------------------------- #
@@ -420,7 +420,61 @@ def draw_side_by_side(A: Page, B: Page, pairs: list[dict], height: int = 2000) -
     return cv2.hconcat([pa, np.full((height, 30, 3), 255, np.uint8), pb])
 
 
+def run_cross_spotting(image_a: str | Path, image_b: str | Path,
+                       out_dir: str | Path = "cross_out",
+                       cp: CrossParams | None = None,
+                       verbose: bool = True) -> list[dict]:
+    """Run the full pipeline on two page images and write the outputs.
+
+    Can be called from other code (no command-line arguments needed):
+
+        from cross_spotting import run_cross_spotting, CrossParams
+        pairs = run_cross_spotting("000126.jpg", "mstest.jpg", "cross_out",
+                                   CrossParams(z_threshold=3.0))
+
+    Returns the accepted matches; each is a dict with candidate indices
+    (i, j), z-scores and component scores. Writes cross_matches.csv,
+    cross_matches.jpg and cross_overlay.jpg to `out_dir`.
+    """
+    cp = cp or CrossParams()
+    sp = SpotParams()
+    for img in (image_a, image_b):
+        if not Path(img).is_file():
+            raise FileNotFoundError(f"image not found: {img}")
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+
+    A, B = load_page(str(image_a), cp, sp), load_page(str(image_b), cp, sp)
+    prepare_features(A, B, cp, sp)           # statistics pooled over both pages
+    pairs = match(A, B, cp)
+
+    with open(out / "cross_matches.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([f"{A.name}_candidate", f"{B.name}_candidate", "z_context",
+                    "z_score", "neighbour_support", "combined_score", "hog_cosine",
+                    "dtw_distance"])
+        for p in pairs:
+            w.writerow([A.cands[p["i"]].tid, B.cands[p["j"]].tid, f"{p['z']:.2f}",
+                        f"{p['z_base']:.2f}", f"{p['support']:.2f}", f"{p['score']:.2f}",
+                        f"{p['cos']:.3f}", f"{p['dtw']:.3f}"])
+    cv2.imwrite(str(out / "cross_matches.jpg"), draw_pairs(A, B, pairs))
+    cv2.imwrite(str(out / "cross_overlay.jpg"), draw_side_by_side(A, B, pairs),
+                [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    if verbose:
+        print(f"{A.name}: {len(A.cands)} candidates (line pitch {A.unit:.0f}px); "
+              f"{B.name}: {len(B.cands)} candidates (line pitch {B.unit:.0f}px)")
+        print(f"{len(pairs)} matches (z >= {cp.z_threshold}, margin {cp.margin}, "
+              f"reciprocal top-{cp.top_k}, whiten {cp.whiten}, weights hog/profile/"
+              f"hogdtw {cp.hog_weight}/{cp.dtw_weight}/{cp.hog_dtw_weight}, "
+              f"context {cp.context_weight})")
+        print(f"{sum(p['z_base'] < cp.z_threshold for p in pairs)} of them admitted "
+              f"only through phrase context")
+        print(f"outputs written to {out.resolve()}")
+    return pairs
+
+
 def main() -> None:
+    """Command-line entry point (used when arguments are given)."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image_a"); ap.add_argument("image_b")
@@ -444,35 +498,33 @@ def main() -> None:
                      size_shortlist=a.size_shortlist, dtw_weight=a.dtw_weight,
                      context_weight=a.context_weight, whiten=a.whiten,
                      hog_weight=a.hog_weight, hog_dtw_weight=a.hog_dtw_weight)
-    sp = SpotParams()
-    out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
+    run_cross_spotting(a.image_a, a.image_b, a.out_dir, cp)
 
-    A, B = load_page(a.image_a, cp, sp), load_page(a.image_b, cp, sp)
-    prepare_features(A, B, cp, sp)           # statistics pooled over both pages
-    pairs = match(A, B, cp)
 
-    with open(out / "cross_matches.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([f"{A.name}_candidate", f"{B.name}_candidate", "z_context",
-                    "z_score", "neighbour_support", "combined_score", "hog_cosine",
-                    "dtw_distance"])
-        for p in pairs:
-            w.writerow([A.cands[p["i"]].tid, B.cands[p["j"]].tid, f"{p['z']:.2f}",
-                        f"{p['z_base']:.2f}", f"{p['support']:.2f}", f"{p['score']:.2f}",
-                        f"{p['cos']:.3f}", f"{p['dtw']:.3f}"])
-    cv2.imwrite(str(out / "cross_matches.jpg"), draw_pairs(A, B, pairs))
-    cv2.imwrite(str(out / "cross_overlay.jpg"), draw_side_by_side(A, B, pairs),
-                [cv2.IMWRITE_JPEG_QUALITY, 85])
+# --------------------------------------------------------------------------- #
+# Run settings - used when the script is started without arguments
+# (e.g. the Run button in PyCharm). Relative paths are resolved against the
+# folder containing this script, so the working directory does not matter.
+# --------------------------------------------------------------------------- #
+HERE = Path(__file__).resolve().parent
 
-    print(f"{A.name}: {len(A.cands)} candidates (line pitch {A.unit:.0f}px); "
-          f"{B.name}: {len(B.cands)} candidates (line pitch {B.unit:.0f}px)")
-    print(f"{len(pairs)} matches (z >= {cp.z_threshold}, margin {cp.margin}, "
-          f"reciprocal top-{cp.top_k}, whiten {cp.whiten}, weights hog/profile/"
-          f"hogdtw {cp.hog_weight}/{cp.dtw_weight}/{cp.hog_dtw_weight}, "
-          f"context {cp.context_weight})")
-    print(f"{sum(p['z_base'] < cp.z_threshold for p in pairs)} of them admitted "
-          f"only through phrase context")
+SETTINGS = dict(
+    image_a="/home/isuri/PycharmProjects/SETS_image_processing/data/000126.jpg",          # first page
+    image_b="/home/isuri/PycharmProjects/SETS_image_processing/data/mstest.jpg",          # second page
+    out_dir=HERE / "cross_out",           # where results are written
+    params=CrossParams(
+        z_threshold=3.25,                 # higher = fewer, more reliable matches
+        whiten=True,                      # whitened HOG (best configuration)
+        hog_weight=0.5, dtw_weight=0.5, hog_dtw_weight=0.0,
+        context_weight=0.35,              # phrase-context bonus (0 = off)
+    ),
+)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1:                 # arguments given -> command line
+        main()
+    else:                                 # no arguments -> SETTINGS above
+        run_cross_spotting(SETTINGS["image_a"], SETTINGS["image_b"],
+                           SETTINGS["out_dir"], SETTINGS["params"])

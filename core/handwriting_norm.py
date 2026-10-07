@@ -21,6 +21,7 @@ proportional to the word, for DTW; `to_canvas` resizes it to the fixed HOG
 canvas.
 """
 
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 from skimage.feature import hog
 
-from segment_manuscript import (Box, Params, binarise, group_palette,
+from core.segment_manuscript import (Box, Params, binarise, group_palette,
                                 log_euclidean_similarity, segment)
 
 
@@ -237,6 +237,8 @@ def main() -> None:
     ap.add_argument("--visual_threshold", type=float, default=SpotParams.visual_threshold)
     ap.add_argument("--top_k", type=int, default=15)
     ap.add_argument("--query", default=None, help="token id, e.g. c2_l10_t4")
+    ap.add_argument("image", nargs="?", default="data/000126.jpg",
+                    help="page image (default: data/000126.jpg)")
     a = ap.parse_args()
 
     sp = SpotParams(size_shortlist=a.size_shortlist, visual_threshold=a.visual_threshold)

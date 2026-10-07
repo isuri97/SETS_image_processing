@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from handwriting_norm import NormParams
+from core.handwriting_norm import NormParams
 
 
 def column_features(word: np.ndarray, p: NormParams = NormParams(),
