@@ -9,7 +9,8 @@ Metrics
 """
 import csv, dataclasses, pickle, sys
 import numpy as np, cv2
-import cross_spotting as cs, word_spotting as ws
+from core.comparison_of_two_documents.experiment_1 import cross_spotting as cs
+from core.comparison_of_two_documents.experiment_1 import word_spotting as ws
 
 GOOD = {('c1_l26_t1','c1_l22_t1'),('c1_l2_t1','c2_l2_t1'),('c1_l17_t2','c1_l21_t7'),
         ('c1_l9_t6','c1_l6_t7'),('c1_l12_t4','c1_l21_t2'),('c1_l30_t3','c2_l7_t4'),
