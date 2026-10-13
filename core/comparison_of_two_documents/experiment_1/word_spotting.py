@@ -37,8 +37,8 @@ import cv2
 import numpy as np
 from skimage.feature import hog
 
-from core.segment_manuscript import (Box, Params, binarise, group_palette,
-                                log_euclidean_similarity, segment)
+from core.comparison_of_two_documents.experiment_1.segment_manuscript import (Box, Params, binarise, group_palette,
+                                                                              log_euclidean_similarity, segment)
 
 
 # --------------------------------------------------------------------------- #
