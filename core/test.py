@@ -78,9 +78,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from segment_manuscript import Box, Params, _runs, binarise, group_palette, segment
-from handwriting_norm import NormParams, normalise_word, to_canvas
-from profile_dtw import column_features, dtw_matrix
+from core.comparison_of_two_documents.experiment_1.segment_manuscript import Box, Params, _runs, binarise, group_palette, segment
+from core.comparison_of_two_documents.experiment_1 import normalise_word, to_canvas
+from core.comparison_of_two_documents.experiment_1.profile_dtw import column_features, dtw_matrix
 from core import SpotParams, compute_hog, tighten_to_ink
 
 
