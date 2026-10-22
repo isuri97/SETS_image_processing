@@ -28,6 +28,7 @@ so any frontend (Streamlit, notebook, web page) can sit on top.
 
 Files
 -----
+    app.py          Streamlit app to view and annotate the clusters
     annotation.py   this file: storage, actions, sheets, export, command line
     review.py       checks whether each word fits its cluster (flags)
     recognition.py  TrOCR reading and automatic names
@@ -225,6 +226,11 @@ class ClusterStore:
 
     def close(self) -> None:
         """Nothing to close (kept so existing code keeps working)."""
+
+    def reload(self) -> None:
+        """Re-read the files, e.g. after another program (the command line,
+        a second app tab) changed them. Page images stay cached."""
+        self._load()
 
     def _save(self) -> None:
         for key in ("runs", "clusters", "occurrences"):
@@ -708,6 +714,8 @@ class ClusterStore:
             return f"{c['kind']}: {c['name']}{src}"
         if c.get("auto_name"):
             return f"unlabelled - auto: {c['auto_name']} {c.get('auto_votes') or ''}".rstrip()
+        if c.get("auto_votes"):                      # read, but readings disagree
+            return f"unlabelled - auto: {c['auto_votes']}"
         return "unlabelled"
 
     @classmethod
@@ -883,6 +891,7 @@ def _auto_command(store: ClusterStore, run: str, a) -> None:
         store, run, recogniser, lexicon=lexicon, recompute=a.recompute,
         progress=lambda k, t: print(f"  {k}/{t} words read", end="\r", flush=True))
     print(f"\n{result['read']} words read, {result['named']} clusters named automatically, "
+          f"{result['unagreed']} without agreement (name them by hand), "
           f"{result['changed']} suggestions changed")
     for c in store.list_clusters(run, status="pending"):
         if c.get("auto_name"):
