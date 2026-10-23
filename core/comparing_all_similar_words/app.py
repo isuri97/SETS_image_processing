@@ -16,8 +16,8 @@ For each cluster the annotator can
   - compare with the suggested cluster side by side
   - move a word to another cluster or to a new one, or remove it
   - accept all suggestions of the cluster at once
-  - label the cluster as concept or signifier (name prefilled with the
-    automatic name, if any - edit it to type one by hand)
+  - assign the cluster to a concept of the list, or define a new concept;
+    its value (prefilled with the automatic name) becomes a signifier of it
   - remove, restore or merge whole clusters
   - export the result (CSV or W3C Web Annotation JSON-LD)
 
@@ -44,7 +44,7 @@ if str(HERE) not in sys.path:                    # sibling modules, however the 
 
 import recognition                               # noqa: E402
 import review                                    # noqa: E402
-from annotation import KINDS, AnnotationError, ClusterStore   # noqa: E402
+from annotation import AnnotationError, ClusterStore   # noqa: E402
 
 # Full-width buttons and images: newer Streamlit uses width="stretch",
 # older versions use_container_width=True (since removed in favour of width).
@@ -272,22 +272,63 @@ def word_tile(store: ClusterStore, run: str, cid: int, o, chk, readings: dict,
                                      store.remove_occurrence, cid, o.occ_id, annotator))
 
 
+EXISTING, NEW = "Existing concept", "New concept"
+
+
 def save_label(store: ClusterStore, run: str, c: dict, annotator: str, keys: dict) -> None:
-    """Callback of the label form. The automatic name left unchanged is
-    recorded as accepted (name_source auto); an edited or typed one as
-    manual; an empty name leaves the cluster unnamed."""
-    kind = st.session_state[keys["kind"]]
-    name = st.session_state[keys["name"]].strip() or None
+    """Callback of the Save button: assign the cluster to the chosen
+    existing concept, or define the typed new concept first. The cluster's
+    value becomes a signifier of that concept; the automatic value left
+    unchanged is recorded as accepted (name_source auto), an edited or typed
+    one as manual."""
+    new = st.session_state[keys["mode"]] == NEW
+    concept = (st.session_state.get(keys["new"] if new else keys["concept"]) or "").strip()
+    value = st.session_state[keys["value"]].strip() or None
     note = st.session_state[keys["note"]].strip() or None
-    auto = name is not None and name == c.get("auto_name") and \
+    auto = value is not None and value == c.get("auto_name") and \
         (c["name"] is None or c.get("name_source") == "auto")
-    do(store, run, f"cluster #{c['number']} labelled {kind}" + (f" '{name}'" if name else ""),
-       store.label, c["cluster_id"], kind, None if auto else name, annotator, note,
-       use_auto=auto)
+    do(store, run, f"cluster #{c['number']}: '{value}' is now a signifier of "
+                   f"{'the new ' if new else ''}concept '{concept}'",
+       store.assign, c["cluster_id"], concept, annotator,
+       value=None if auto else value, note=note, new=new)
+
+
+def concept_group(store: ClusterStore, concept: str | None) -> None:
+    """The signifiers a concept already has (over all runs), so the
+    annotator can see whether this cluster belongs with them."""
+    if not concept:
+        return
+    linked = store.concept_clusters(concept)
+    st.caption(f"**{concept}** · " + (" · ".join(f"*{x['name'] or '?'}* #{x['number']}"
+                                                   for x in linked)
+                                        if linked else "no signifiers yet"))
+
+
+def manage_concepts(store: ClusterStore, run: str, annotator: str) -> None:
+    """The concept list with each concept's signifiers, and a Delete button
+    per concept. Delete is only possible while no cluster is assigned to the
+    concept (unassign those clusters first)."""
+    concepts = store.concepts()
+    with st.popover(f"Manage concepts ({len(concepts)})", **FULL):
+        if not concepts:
+            st.caption("The concept list is empty.")
+            return
+        for name in concepts:
+            users = store.concept_users(name)
+            text, button = st.columns([4, 1], vertical_alignment="center")
+            sig = ", ".join(store.signifiers(name)) or "no signifiers"
+            text.markdown(f"**{name}**  \n:gray[{sig}]")
+            in_use = ", ".join(f"#{u['number']}" for u in users[:6]) + \
+                ("…" if len(users) > 6 else "")
+            button.button("🗑", key=f"delc_{name}", disabled=bool(users),
+                          help=f"used by cluster(s) {in_use} - unassign them first"
+                          if users else f"delete '{name}' from the list",
+                          on_click=do, args=(store, run, f"concept '{name}' deleted",
+                                             store.delete_concept, name, annotator))
 
 
 def label_panel(store: ClusterStore, run: str, c: dict, annotator: str) -> None:
-    """Concept / signifier, name, and whole-cluster actions."""
+    """Concept assignment, signifier value, and whole-cluster actions."""
     cid = c["cluster_id"]
     if c["status"] == "removed":
         st.warning(f"This cluster was removed{': ' + c['note'] if c.get('note') else ''}.")
@@ -296,21 +337,49 @@ def label_panel(store: ClusterStore, run: str, c: dict, annotator: str) -> None:
                         cid, annotator))
         return
 
-    # widget keys include the stored values, so the form shows fresh values
-    # whenever the label or the automatic name changes
-    tag = f"{cid}_{c['kind']}_{c['name']}_{c.get('auto_name')}"
-    keys = {"kind": f"kind_{tag}", "name": f"name_{tag}", "note": f"note_{tag}"}
-    with st.form(f"label_{cid}", border=True):
+    # widget keys include the stored values (and the size of the concept
+    # list), so the box shows fresh values whenever one of them changes
+    concepts = store.concepts()
+    auto = c.get("auto_name")
+    tag = f"{cid}_{c['name']}_{auto}_{c.get('concept')}_{len(concepts)}"
+    keys = {k: f"{k}_{tag}" for k in ("mode", "concept", "new", "value", "note")}
+    # Step 1 is preset from what is known: the cluster's concept, else a
+    # listed concept matching (or spelled like) its automatic value
+    match = c.get("concept") or store.find_concept(auto)
+    similar = [] if match or not auto else store.similar_concepts(auto)
+    preset = match or (similar[0] if similar else None)
+
+    with st.container(border=True):
         st.markdown("**Label**")
-        st.radio("Kind", KINDS, horizontal=True, key=keys["kind"],
-                 index=KINDS.index(c["kind"]) if c["kind"] in KINDS else 0)
-        hint = f"automatic: {c['auto_name']} ({c['auto_votes']})" if c.get("auto_name") else \
-            (f"automatic: {c['auto_votes']}" if c.get("auto_votes") else "no automatic name")
-        st.text_input("Name", c["name"] or c.get("auto_name") or "", key=keys["name"],
-                      help=hint, placeholder="type the name")
+        st.radio("1 · Does this cluster belong to a concept in the list?",
+                 (EXISTING, NEW) if concepts else (NEW,), horizontal=True, key=keys["mode"],
+                 index=0,                  # check the list first, if there is one
+                 help=f"{len(concepts)} concept(s) in the list")
+        if st.session_state[keys["mode"]] == EXISTING:
+            st.selectbox("Concept", concepts, key=keys["concept"],
+                         index=concepts.index(preset) if preset in concepts else None,
+                         placeholder="check the list…")
+            if similar and not match:
+                st.caption(f"spelled like the automatic value: {', '.join(similar)}")
+            concept_group(store, st.session_state[keys["concept"]])
+            if st.session_state[keys["concept"]] is None:
+                st.caption(f"Not in the list? Choose {NEW}.")
+        else:
+            st.text_input("New concept", auto or "", key=keys["new"],
+                          placeholder="name of the new concept",
+                          help="Added to the concept list when you save")
+            typed = st.session_state[keys["new"]]
+            if store.find_concept(typed):
+                st.warning(f"'{store.find_concept(typed)}' is already in the list - "
+                           f"choose {EXISTING}.")
+        hint = f"automatic: {auto} ({c['auto_votes']})" if auto else \
+            (f"automatic: {c['auto_votes']}" if c.get("auto_votes") else "no automatic value")
+        st.text_input("2 · Signifier (value of this cluster)",
+                      c["name"] or auto or "", key=keys["value"], help=hint,
+                      placeholder="type the word this cluster shows")
         st.text_input("Note", c.get("note") or "", key=keys["note"])
-        st.form_submit_button("Save label", type="primary", on_click=save_label,
-                              args=(store, run, c, annotator, keys))
+        st.button("Save", type="primary", key=f"save_{tag}", on_click=save_label,
+                  args=(store, run, c, annotator, keys))
 
     with st.popover("Remove cluster", **FULL):
         st.text_input("Reason", key=f"reason_{cid}")
@@ -327,9 +396,10 @@ def label_panel(store: ClusterStore, run: str, c: dict, annotator: str) -> None:
                                           f"{targets[st.session_state[f'merge_{cid}']].split(' ')[0]}",
                                           store.merge, cid, st.session_state[f"merge_{cid}"],
                                           annotator))
+    manage_concepts(store, run, annotator)
     if c["status"] == "labelled":
-        st.button("Unlabel (back to pending)", key=f"unl_{cid}", **FULL, on_click=do,
-                  args=(store, run, f"cluster #{c['number']} back to pending", store.unlabel,
+        st.button("Unassign (back to pending)", key=f"unl_{cid}", **FULL, on_click=do,
+                  args=(store, run, f"cluster #{c['number']} back to pending", store.unassign,
                         cid, annotator))
 
 

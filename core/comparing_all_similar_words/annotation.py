@@ -4,18 +4,30 @@ Annotation backend for word-spotting clusters (annotation.py).
 Takes the output of cross_spotting.run_spotting() (clusters.csv plus the
 page images) and lets an annotator review every cluster and decide one of:
 
-    concept    - label the cluster as a concept
-    signifier  - label the cluster as a signifier
+    assign     - the cluster is a signifier of a concept
     remove     - reject the cluster (false positive, flourish, noise)
 
-Names are filled in automatically: `auto` reads every word with TrOCR
-(recognition.py) and gives each cluster the reading most of its words
-agree on. The annotator decides concept / signifier and either keeps the
-automatic name or types one by hand:
+Concepts and signifiers
+-----------------------
+The concepts form a list (a dictionary) kept in concepts.csv. It can be
+filled beforehand from a file of known concepts (`concepts import`), edited
+in Excel, or grown during annotation. For every cluster the annotator first
+checks whether it belongs to a concept already in the list:
 
-    label 9 concept             -> concept, automatic name   (name_source auto)
-    label 9 concept "Padova"    -> concept, name typed by hand (manual)
-    name 9 "Padova"             -> correct the name of a labelled cluster
+    yes -> assign it to that concept
+    no  -> define a new concept (it is added to the list) and assign it
+
+Either way the cluster's value - the word it shows, e.g. "Padua" - becomes
+a signifier of that concept. The value is filled in automatically: `auto`
+reads every word with TrOCR (recognition.py) and gives each cluster the
+reading most of its words agree on; the annotator keeps it or types one.
+concepts.csv lists, for each concept, all its signifiers.
+
+    assign 9 --concept Padova --by isuri          existing concept, value auto
+    assign 9 --concept Padova --value Padua --by isuri   value typed
+    assign 9 --new Padova --by isuri              new concept, then assign
+    value 9 "Padua" --by isuri                    correct a cluster's value
+    reset --by isuri                              clear all assignments
 
 Mixed clusters can be cleaned first: an occurrence that belongs to another
 cluster is moved there (or into a new cluster), and one that is not a word
@@ -41,10 +53,14 @@ the commands, so they are checked and logged.
 
     runs.csv            imported run_spotting() output folders
     pages.csv           page name -> image path
+    concepts.csv        the concept list, shared by all runs: concept, its
+                        signifiers and number of clusters (kept up to date
+                        from the assignments), note, source (dictionary /
+                        annotator), added_by, added_at
     cluster_labels.csv  one row per cluster: status (pending / labelled /
-                        removed / merged), kind (concept / signifier), name,
-                        name_source (auto / manual), auto_name, auto_votes,
-                        note, annotator, time - the annotation result
+                        removed / merged), concept, name (the signifier
+                        value), name_source (auto / manual), auto_name,
+                        auto_votes, note, annotator, time - the result
     occurrences.csv     one row per word: its current cluster, page, box,
                         and whether it was removed
     readings.csv        TrOCR reading of every word (recognition.py)
@@ -63,9 +79,11 @@ Python use
     run = store.import_run("result", image_dir="data")      # once per run
     recognition.auto_name_clusters(store, run, recognition.TrOCRRecogniser())
 
+    store.import_concepts("concepts.txt", annotator="isuri")  # optional dictionary
     cid = store.cluster_id(run, 9)                          # cluster number -> id
-    store.label(cid, "concept", annotator="isuri")          # automatic name
-    store.label(cid, "concept", "Padova", annotator="isuri")  # typed name
+    store.assign(cid, "Padova", annotator="isuri")          # existing, value auto
+    store.assign(cid, "Padova", "isuri", value="Padua")     # value typed
+    store.assign(cid, "Venezia", "isuri", new=True)         # new concept
     store.move_occurrence(occ_id, into=other_cid, annotator="isuri")
     store.remove(other_cid, annotator="isuri", reason="flourish")
     store.export_csv("labels.csv", run)
@@ -76,11 +94,18 @@ Command line (from the project root)
     $A import <result> --image_dir data
     $A auto                                  # TrOCR names every cluster
     $A review                                # sheets: flags + automatic names
-    $A list [--status pending]
-    $A label 9 concept --by isuri            # keep the automatic name
-    $A label 9 concept "Padova" --by isuri   # or type the name
-    $A label 9 signifier --no_auto --by isuri  # no name at all
-    $A name 9 "Padova" --by isuri            # correct a name later
+    $A concepts import concepts.txt --by isuri  # load a dictionary (optional)
+    $A concepts                              # the concept list
+    $A concepts add "Venezia" --by isuri     # add one by hand
+    $A concepts rename Padua Padova --by isuri
+    $A concepts delete Venezia --by isuri    # only if no cluster uses it
+    $A list [--status pending] [--concept Padova]
+    $A assign 9 --concept Padova --by isuri  # existing concept, value auto
+    $A assign 9 --concept Padova --value Padua --by isuri
+    $A assign 9 --new Venezia --by isuri     # define a new concept
+    $A value 9 "Padua" --by isuri            # correct a value later
+    $A unassign 9 --by isuri                 # back to pending
+    $A reset --by isuri                      # clear all assignments (backup kept)
     $A remove 7 --reason flourish --by isuri
     $A move 41 --to 10 --by isuri            # occ 41 -> cluster 10
     $A move 41 57 --new --by isuri           # new cluster from occs
@@ -103,6 +128,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import difflib
 import json
 import os
 from collections import Counter
@@ -115,7 +141,7 @@ from typing import Iterator, Sequence
 import cv2
 import numpy as np
 
-KINDS = ("concept", "signifier")          # allowed labels for a cluster
+KINDS = ("signifier",)                    # what an assigned cluster is (kind column)
 STATUSES = ("pending", "labelled", "removed", "merged")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
 
@@ -129,9 +155,17 @@ TABLES = {
         ("cluster_id", int), ("run_id", str), ("number", int), ("best_z", float),
         ("status", str), ("kind", str), ("name", str), ("note", str),
         ("merged_into", int), ("annotator", str), ("updated_at", str),
-        ("name_source", str),         # auto (TrOCR name accepted) / manual (typed)
+        ("name_source", str),         # auto (TrOCR value kept) / manual (typed)
         ("auto_name", str),           # automatic name suggestion (recognition.py)
-        ("auto_votes", str)]),        # e.g. "3/4": words whose reading agrees
+        ("auto_votes", str),          # e.g. "3/4": words whose reading agrees
+        ("concept", str)]),           # concept the cluster names or refers to
+    "concepts": ("concepts.csv", [
+        ("concept", str),
+        ("signifiers", str),          # values of its clusters, "; "-separated (derived)
+        ("n_clusters", int),          # clusters assigned to it (derived)
+        ("note", str),
+        ("source", str),              # dictionary (imported list) / annotator
+        ("added_by", str), ("added_at", str)]),
     "occurrences": ("occurrences.csv", [
         ("occ_id", int), ("cluster_id", int), ("origin_cluster", int), ("page", str),
         ("token", str), ("candidate", str), ("x0", int), ("y0", int), ("x1", int),
@@ -220,6 +254,7 @@ class ClusterStore:
         self._pages = {(p["run_id"], p["name"]): p["path"] for p in t["pages"]}
         self._clusters = {c["cluster_id"]: c for c in t["clusters"]}
         self._occ = {o["occ_id"]: o for o in t["occurrences"]}
+        self._concepts = {c["concept"]: c for c in t["concepts"] if c["concept"]}
         hist = self.folder / HISTORY[0]
         self._history = list(csv.DictReader(open(hist, newline="", encoding="utf-8"))) \
             if hist.is_file() else []
@@ -233,10 +268,13 @@ class ClusterStore:
         self._load()
 
     def _save(self) -> None:
-        for key in ("runs", "clusters", "occurrences"):
+        self._update_signifiers()
+        for key in ("runs", "clusters", "occurrences", "concepts"):
             fname, cols = TABLES[key]
             data = {"runs": self._runs, "clusters": self._clusters.values(),
-                    "occurrences": self._occ.values()}[key]
+                    "occurrences": self._occ.values(),
+                    "concepts": sorted(self._concepts.values(),
+                                       key=lambda c: c["concept"].casefold())}[key]
             _write_atomic(self.folder / fname, [c for c, _ in cols],
                           [["" if r[c] is None else r[c] for c, _ in cols] for r in data])
         fname, cols = TABLES["pages"]
@@ -253,17 +291,31 @@ class ClusterStore:
             self._history += [dict(zip(HISTORY[1], map(str, e))) for e in self._pending_events]
             self._pending_events = []
 
+    def _update_signifiers(self) -> None:
+        """Fill the derived columns of the concept list from the assigned
+        clusters: the distinct signifier values and the cluster count."""
+        values: dict[str, list[str]] = {k: [] for k in self._concepts}
+        count: Counter = Counter()
+        for c in sorted(self._clusters.values(), key=lambda c: (c["run_id"], c["number"])):
+            if c["status"] == "labelled" and c.get("concept") in values:
+                count[c["concept"]] += 1
+                if c["name"] and c["name"] not in values[c["concept"]]:
+                    values[c["concept"]].append(c["name"])
+        for k, entry in self._concepts.items():
+            entry.update(signifiers="; ".join(values[k]) or None, n_clusters=count[k])
+
     @contextmanager
     def _tx(self) -> Iterator[None]:
         """One action = one save. If anything fails, the in-memory state is
         rolled back and nothing is written."""
         snapshot = (copy.deepcopy(self._runs), dict(self._pages),
-                    copy.deepcopy(self._clusters), copy.deepcopy(self._occ))
+                    copy.deepcopy(self._clusters), copy.deepcopy(self._occ),
+                    copy.deepcopy(self._concepts))
         try:
             yield
             self._save()
         except BaseException:
-            self._runs, self._pages, self._clusters, self._occ = snapshot
+            self._runs, self._pages, self._clusters, self._occ, self._concepts = snapshot
             self._pending_events = []
             raise
 
@@ -315,7 +367,7 @@ class ClusterStore:
                         cluster_id=next_cid, run_id=run_id, number=num,
                         best_z=float(r["best_z"]), status="pending", kind=None, name=None,
                         note=None, merged_into=None, annotator=None, updated_at=None,
-                        name_source=None, auto_name=None, auto_votes=None)
+                        name_source=None, auto_name=None, auto_votes=None, concept=None)
                     next_cid += 1
                 self._occ[next_occ] = dict(
                     occ_id=next_occ, cluster_id=ids[num], origin_cluster=ids[num],
@@ -383,7 +435,8 @@ class ClusterStore:
                 if self._clusters[o["origin_cluster"]]["run_id"] == run_id]
 
     def list_clusters(self, run_id: str, status: str | None = None,
-                      kind: str | None = None, unnamed: bool = False) -> list[dict]:
+                      kind: str | None = None, unnamed: bool = False,
+                      concept: str | None = None) -> list[dict]:
         """Clusters of a run in their original order, optionally filtered
         (unnamed=True: labelled clusters that still have no name)."""
         size: Counter = Counter()
@@ -396,6 +449,7 @@ class ClusterStore:
         for c in self._clusters.values():
             if c["run_id"] != run_id or (status and c["status"] != status) \
                     or (kind and c["kind"] != kind) \
+                    or (concept and c.get("concept") != self.find_concept(concept)) \
                     or (unnamed and not (c["status"] == "labelled" and c["name"] is None)):
                 continue
             out.append(dict(c, size=size[c["cluster_id"]],
@@ -424,18 +478,145 @@ class ClusterStore:
         return None
 
     def progress(self, run_id: str) -> dict[str, int]:
-        counts = {s: 0 for s in STATUSES} | {k: 0 for k in KINDS}
-        for c in self.list_clusters(run_id):
+        """Counts for a run. 'concept' is the number of concepts its
+        clusters are assigned to, 'signifier' the number of assigned
+        clusters (one signifier each)."""
+        clusters = self.list_clusters(run_id)
+        counts = {s: 0 for s in STATUSES}
+        for c in clusters:
             counts[c["status"]] += 1
-            if c["kind"]:
-                counts[c["kind"]] += 1
         counts["total"] = sum(counts[s] for s in STATUSES)
-        counts["unnamed"] = len(self.list_clusters(run_id, unnamed=True))
-        open_ = [c for c in self.list_clusters(run_id) if c["status"] in ("pending", "labelled")]
+        assigned = [c for c in clusters if c["status"] == "labelled"]
+        counts["signifier"] = sum(1 for c in assigned if c.get("concept"))
+        counts["concept"] = len({c["concept"] for c in assigned if c.get("concept")})
+        counts["no_concept"] = sum(1 for c in assigned if not c.get("concept"))
+        open_ = [c for c in clusters if c["status"] in ("pending", "labelled")]
         counts["auto_named"] = sum(1 for c in open_ if c.get("auto_name"))
-        counts["name_auto"] = sum(1 for c in open_ if c.get("name_source") == "auto")
-        counts["name_manual"] = sum(1 for c in open_ if c.get("name_source") == "manual")
+        counts["name_auto"] = sum(1 for c in assigned if c.get("name_source") == "auto")
+        counts["name_manual"] = sum(1 for c in assigned if c.get("name_source") == "manual")
+        counts["concepts_in_list"] = len(self._concepts)
         return counts
+
+    # ------------------------------------------------------------------ #
+    # Concept list (dictionary)
+    # ------------------------------------------------------------------ #
+    def concepts(self) -> list[str]:
+        """Names of all concepts in the list, alphabetically."""
+        return sorted(self._concepts, key=str.casefold)
+
+    def find_concept(self, name: str | None) -> str | None:
+        """The concept in the list matching `name` (ignoring case and
+        surrounding spaces), or None."""
+        key = (name or "").strip().casefold()
+        return next((c for c in self._concepts if c.casefold() == key), None) if key else None
+
+    def similar_concepts(self, name: str, n: int = 3) -> list[str]:
+        """Concepts spelled like `name` - to catch a typo before a near
+        duplicate is added."""
+        low = {c.casefold(): c for c in self._concepts}
+        return [low[m] for m in difflib.get_close_matches(name.strip().casefold(), low, n, 0.75)]
+
+    def _add_concept(self, name: str, annotator: str | None, source: str,
+                     note: str | None = None) -> str:
+        """Add to the list inside an open transaction; returns the stored name
+        (the existing spelling if the concept is already there)."""
+        name = (name or "").strip()
+        if not name:
+            raise AnnotationError("concept name is empty")
+        existing = self.find_concept(name)
+        if existing:
+            return existing
+        self._concepts[name] = dict(concept=name, signifiers=None, n_clusters=0, note=note,
+                                    source=source, added_by=annotator, added_at=_now())
+        self._log("add_concept", None, annotator, concept=name, source=source)
+        return name
+
+    def add_concept(self, name: str, annotator: str, note: str | None = None) -> str:
+        """Add a concept to the list (nothing happens if it is already there,
+        in any capitalisation). Returns the concept's stored name."""
+        with self._tx():
+            return self._add_concept(name, annotator, "annotator", note)
+
+    def import_concepts(self, path: str | Path, annotator: str | None = None) -> int:
+        """Load a dictionary of known concepts: a .txt file with one concept
+        per line (lines starting with # are skipped), or a .csv file with a
+        'concept' column (else its first column; an optional 'note' column
+        is kept). Concepts already in the list are skipped. Returns the
+        number added."""
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"{path} not found")
+        rows: list[tuple[str, str | None]] = []
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            if path.suffix.lower() == ".csv":
+                reader = csv.DictReader(f)
+                col = "concept" if "concept" in (reader.fieldnames or []) \
+                    else (reader.fieldnames or [None])[0]
+                rows = [(r.get(col) or "", r.get("note") or None) for r in reader]
+            else:
+                rows = [(line, None) for line in f if not line.lstrip().startswith("#")]
+        before = len(self._concepts)
+        with self._tx():
+            for name, note in rows:
+                if name.strip():
+                    self._add_concept(name, annotator, "dictionary", note)
+        return len(self._concepts) - before
+
+    def concept_clusters(self, concept: str, run_id: str | None = None) -> list[dict]:
+        """Clusters assigned to a concept (its signifiers), optionally of
+        one run, in cluster order."""
+        out = [c for c in self._clusters.values()
+               if c.get("concept") == concept and c["status"] == "labelled"
+               and (run_id is None or c["run_id"] == run_id)]
+        return sorted(out, key=lambda c: (c["run_id"], c["number"]))
+
+    def signifiers(self, concept: str) -> list[str]:
+        """Distinct signifier values of a concept, over all runs."""
+        return list(dict.fromkeys(c["name"] for c in self.concept_clusters(concept)
+                                  if c["name"]))
+
+    def rename_concept(self, old: str, new: str, annotator: str) -> None:
+        """Rename a concept everywhere: the list and the clusters assigned
+        to it. Renaming onto another concept that already exists merges the
+        two."""
+        src = self.find_concept(old)
+        if src is None:
+            raise AnnotationError(f"no concept '{old}'")
+        new = (new or "").strip()
+        if not new:
+            raise AnnotationError("new concept name is empty")
+        target = self.find_concept(new)
+        with self._tx():
+            entry = self._concepts.pop(src)
+            if target is None or target == src:
+                self._concepts[new] = dict(entry, concept=new)
+                target = new
+            for c in self._clusters.values():
+                if c.get("concept") == src:
+                    c["concept"] = target
+            self._log("rename_concept", None, annotator, old=src, new=target)
+
+    def concept_users(self, name: str) -> list[dict]:
+        """Clusters (of any run, not merged) still linked to a concept - a
+        concept can only be deleted when this is empty."""
+        src = self.find_concept(name)
+        return sorted((c for c in self._clusters.values()
+                       if src and c.get("concept") == src and c["status"] != "merged"),
+                      key=lambda c: (c["run_id"], c["number"]))
+
+    def delete_concept(self, name: str, annotator: str) -> None:
+        """Remove a concept from the list. Refused while a labelled or
+        removed cluster is still linked to it (unassign or rename instead)."""
+        src = self.find_concept(name)
+        if src is None:
+            raise AnnotationError(f"no concept '{name}'")
+        used = self.concept_users(src)
+        if used:
+            nums = ", ".join(f"#{c['number']}" for c in used[:8])
+            raise AnnotationError(f"concept '{src}' is still used by cluster(s) {nums}")
+        with self._tx():
+            del self._concepts[src]
+            self._log("delete_concept", None, annotator, concept=src)
 
     # ------------------------------------------------------------------ #
     # Actions
@@ -446,45 +627,69 @@ class ClusterStore:
             raise AnnotationError(f"cluster {cluster_id} is {row['status']}; restore it first")
         return row
 
-    def label(self, cluster_id: int, kind: str, name: str | None = None,
-              annotator: str | None = None, note: str | None = None,
-              use_auto: bool = True) -> None:
-        """Define the cluster as a concept or a signifier (always the
-        annotator's decision).
+    def assign(self, cluster_id: int, concept: str, annotator: str,
+               value: str | None = None, note: str | None = None, new: bool = False,
+               use_auto: bool = True) -> str:
+        """Assign the cluster to a concept: its value becomes a signifier of
+        that concept. The annotator first decides whether the concept is
+        already in the list:
 
-        The name:
-          - given (e.g. "Padova")         -> used as typed (name_source manual)
-          - omitted, automatic name exists -> the automatic name is used
-                                              (name_source auto), unless
-                                              use_auto=False
-          - omitted, no automatic name     -> the cluster stays unnamed; a
-                                              name can be added with name()
-        Re-labelling is allowed and logged."""
-        if kind not in KINDS:
-            raise AnnotationError(f"kind must be one of {KINDS}, not '{kind}'")
+          new=False  the concept must be in the list (any capitalisation);
+                     otherwise refused, with similar spellings suggested
+          new=True   a new concept: added to the list first; refused if it
+                     is already there (choose it from the list instead)
+
+        The value (the signifier):
+          - given (e.g. "Padua")           -> used as typed (name_source manual)
+          - omitted, automatic name exists -> the automatic name (name_source
+                                              auto), unless use_auto=False
+          - omitted, no automatic name     -> refused: a signifier needs a value
+
+        Re-assigning is allowed and logged. Returns the concept's stored name."""
         if not annotator:
             raise AnnotationError("annotator is required")
-        name = name.strip() if name and name.strip() else None
+        concept = (concept or "").strip()
+        if not concept:
+            raise AnnotationError("choose a concept from the list or define a new one")
         c = self._require_open(cluster_id)
         if not self.occurrences(cluster_id, include_removed=False):
             raise AnnotationError(f"cluster {cluster_id} has no remaining occurrences")
-        source = "manual" if name else None
-        if name is None and use_auto and c.get("auto_name"):
-            name, source = c["auto_name"], "auto"
+
+        value = value.strip() if value and value.strip() else None
+        source = "manual" if value else None
+        if value is None and use_auto and c.get("auto_name"):
+            value, source = c["auto_name"], "auto"
+        if value is None:
+            raise AnnotationError(f"cluster {cluster_id} has no value: type the signifier")
+
+        existing = self.find_concept(concept)
+        if new and existing:
+            raise AnnotationError(f"concept '{existing}' is already in the list - "
+                                  f"choose it as an existing concept")
+        if not new and existing is None:
+            near = self.similar_concepts(concept)
+            raise AnnotationError(f"'{concept}' is not in the concept list"
+                                  + (f" - did you mean {', '.join(near)}?" if near
+                                     else " - define it as a new concept"))
+
         with self._tx():
-            previous = {"kind": c["kind"], "name": c["name"]}
-            self._touch(c, annotator, status="labelled", kind=kind, name=name, note=note,
-                        name_source=source)
-            self._log("label", cluster_id, annotator, kind=kind, name=name,
-                      name_source=source, note=note, previous=previous)
+            concept = existing or self._add_concept(concept, annotator, "annotator")
+            previous = {"concept": c.get("concept"), "value": c["name"]}
+            self._touch(c, annotator, status="labelled", kind="signifier", name=value,
+                        name_source=source, note=note, concept=concept)
+            self._log("assign", cluster_id, annotator, concept=concept, value=value,
+                      new_concept=new, name_source=source, note=note, previous=previous)
+        return concept
 
     def name(self, cluster_id: int, name: str | None, annotator: str) -> None:
-        """Add, change or clear (None) the name of a labelled cluster by hand,
-        without touching its kind - e.g. correcting an automatic name."""
+        """Change the value (signifier) of an assigned cluster by hand,
+        without touching its concept - e.g. correcting an automatic name."""
         c = self._require_open(cluster_id)
         if c["status"] != "labelled":
-            raise AnnotationError(f"cluster {cluster_id} is {c['status']}; label it first")
+            raise AnnotationError(f"cluster {cluster_id} is {c['status']}; assign it first")
         name = name.strip() if name and name.strip() else None
+        if name is None:
+            raise AnnotationError("a signifier needs a value")
         with self._tx():
             previous = c["name"]
             self._touch(c, annotator, name=name, name_source="manual" if name else None)
@@ -529,8 +734,56 @@ class ClusterStore:
         c = self._require_open(cluster_id)
         with self._tx():
             self._touch(c, annotator, status="pending", kind=None, name=None,
-                        name_source=None)
+                        name_source=None, concept=None)
             self._log("unlabel", cluster_id, annotator)
+
+    unassign = unlabel                       # same action, assignment wording
+    set_value = name
+
+    def reset(self, annotator: str, run_id: str | None = None,
+              concepts: str = "annotator") -> dict[str, int]:
+        """Clear every assignment made so far: assigned clusters go back to
+        pending without concept or value (removed clusters stay removed, but
+        lose their old assignment). Word moves, word removals, merges and
+        the automatic names are kept.
+
+        `run_id`   only that run (default: every run)
+        `concepts` which concepts leave the list: "annotator" (those added
+                   during annotation; the imported dictionary stays), "all",
+                   or "keep" (none)
+
+        A copy of cluster_labels.csv and concepts.csv is written to
+        backup_<time>/ in the annotation folder first. Returns counts."""
+        if concepts not in ("annotator", "all", "keep"):
+            raise AnnotationError("concepts must be 'annotator', 'all' or 'keep'")
+        if not annotator:
+            raise AnnotationError("annotator is required")
+        backup = self.folder / f"backup_{datetime.now():%Y%m%d-%H%M%S}"
+        backup.mkdir(exist_ok=True)
+        for key in ("clusters", "concepts"):
+            f = self.folder / TABLES[key][0]
+            if f.is_file():
+                (backup / f.name).write_bytes(f.read_bytes())
+        n_clusters = 0
+        with self._tx():
+            for c in self._clusters.values():
+                if (run_id is None or c["run_id"] == run_id) \
+                        and c["status"] in ("labelled", "removed") \
+                        and (c["kind"] or c.get("concept") or c["name"]):
+                    c.update(kind=None, name=None, name_source=None, concept=None,
+                             status="pending" if c["status"] == "labelled" else "removed")
+                    if c["status"] == "pending":
+                        c.update(note=None)
+                    n_clusters += 1
+            dropped = [k for k, e in self._concepts.items()
+                       if concepts == "all" or (concepts == "annotator"
+                                                and e.get("source") != "dictionary")]
+            for k in dropped:
+                del self._concepts[k]
+            self._log("reset", None, annotator, run_id=run_id, clusters=n_clusters,
+                      concepts_removed=len(dropped), backup=backup.name)
+        return {"clusters": n_clusters, "concepts_removed": len(dropped),
+                "concepts_left": len(self._concepts), "backup": str(backup)}
 
     def remove_occurrence(self, cluster_id: int, occ_id: int, annotator: str,
                           restore: bool = False) -> None:
@@ -601,7 +854,7 @@ class ClusterStore:
                 cluster_id=new, run_id=run_id, number=number, best_z=None,
                 status="pending", kind=None, name=None, note=None, merged_into=None,
                 annotator=annotator, updated_at=_now(), name_source=None,
-                auto_name=None, auto_votes=None)
+                auto_name=None, auto_votes=None, concept=None)
             for o, s in zip(occ_ids, srcs):
                 self._occ[o].update(cluster_id=new, removed=0)
                 self._log("move_out", s["cluster_id"], annotator, occ_id=o, to=new)
@@ -638,7 +891,12 @@ class ClusterStore:
             if best["status"] == "removed":
                 self.remove(c["cluster_id"], annotator, reason=note)
             else:
-                self.label(c["cluster_id"], best["kind"], best["name"], annotator, note=note)
+                if best.get("concept") and best["name"]:
+                    self.assign(c["cluster_id"], best["concept"], annotator,
+                                value=best["name"], note=note,
+                                new=self.find_concept(best["concept"]) is None)
+                else:
+                    continue
             n += 1
         return n
 
@@ -705,18 +963,18 @@ class ClusterStore:
 
     @staticmethod
     def label_text(c) -> str:
-        """Short description of a cluster's label, e.g. 'concept: Padova
-        (auto)', 'unlabelled - auto: Padova 3/4'."""
-        if c["kind"]:
-            if not c["name"]:
-                return f"{c['kind']} (unnamed)"
+        """Short description of a cluster's assignment, e.g. 'Padua -> Padova
+        (auto)', 'unassigned - auto: Padova 3/4'."""
+        if c["status"] == "labelled" and c.get("concept"):
             src = f" ({c['name_source']})" if c.get("name_source") else ""
-            return f"{c['kind']}: {c['name']}{src}"
+            return f"{c['name'] or '?'} -> {c['concept']}{src}"
+        if c["kind"]:                                # assigned before concepts existed
+            return f"{c['kind']}: {c['name'] or '(unnamed)'} (no concept)"
         if c.get("auto_name"):
-            return f"unlabelled - auto: {c['auto_name']} {c.get('auto_votes') or ''}".rstrip()
+            return f"unassigned - auto: {c['auto_name']} {c.get('auto_votes') or ''}".rstrip()
         if c.get("auto_votes"):                      # read, but readings disagree
-            return f"unlabelled - auto: {c['auto_votes']}"
-        return "unlabelled"
+            return f"unassigned - auto: {c['auto_votes']}"
+        return "unassigned"
 
     @classmethod
     def _title(cls, c) -> str:
@@ -814,11 +1072,13 @@ class ClusterStore:
         n = 0
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["run", "cluster", "status", "kind", "name", "name_source", "auto_name",
+            w.writerow(["run", "cluster", "status", "kind", "concept", "name", "name_source",
+                        "auto_name",
                         "page", "token", "candidate", "x0", "y0", "x1", "y1", "annotator",
                         "updated_at", "note"])
             for c, o in self._decided(run_id, include_removed):
-                w.writerow([run_id, c["number"], c["status"], c["kind"] or "", c["name"] or "",
+                w.writerow([run_id, c["number"], c["status"], c["kind"] or "",
+                            c.get("concept") or "", c["name"] or "",
                             c.get("name_source") or "", c.get("auto_name") or "",
                             o.page, o.token, o.candidate, *o.box, c["annotator"],
                             c["updated_at"], c["note"] or ""])
@@ -830,7 +1090,7 @@ class ClusterStore:
         """W3C Web Annotation (JSON-LD), one annotation per kept occurrence of
         every labelled cluster. The target is the page image (`base_uri` +
         file name) with an xywh fragment selector; the bodies carry the name
-        (tagging) and the kind (classifying)."""
+        (tagging), the kind (classifying) and the concept (linking)."""
         pages = {n: Path(p).name for (r, n), p in self._pages.items() if r == run_id}
         items = []
         for c, o in self._decided(run_id, include_removed=False):
@@ -838,6 +1098,9 @@ class ClusterStore:
             body = [{"type": "TextualBody", "purpose": "classifying", "value": c["kind"]},
                     {"type": "TextualBody", "purpose": "identifying",
                      "value": f"{run_id}/cluster/{c['number']}"}]
+            if c.get("concept"):
+                body.append({"type": "TextualBody", "purpose": "linking",
+                             "value": c["concept"]})
             if c["name"]:                       # unnamed clusters carry no tagging body
                 body.insert(0, {"type": "TextualBody", "purpose": "tagging", "value": c["name"]})
             items.append({
@@ -920,6 +1183,31 @@ def _review_command(store: ClusterStore, run: str, cid: int | None, a) -> None:
         print("\n".join(done) or "nothing to change")
 
 
+def _concepts_command(store: ClusterStore, a) -> None:
+    """The concept list: show it with its clusters, or change it."""
+    need = {"list": 0, "add": 1, "import": 1, "rename": 2, "delete": 1}[a.action]
+    if len(a.values) != need:
+        raise AnnotationError(f"'concepts {a.action}' takes {need} value(s)")
+    if a.action in ("add", "rename", "delete") and not a.by:
+        raise AnnotationError(f"'concepts {a.action}' needs --by")
+    if a.action == "list":
+        run = store.runs()[-1] if store.runs() else None
+        for name in store.concepts():
+            linked = store.concept_clusters(name, a.run or run)
+            members = ", ".join(f"{c['name'] or '?'} (#{c['number']})" for c in linked)
+            print(f"{name:<25} {members or '-'}")
+        print(f"{len(store.concepts())} concepts")
+    elif a.action == "add":
+        print(f"concept '{store.add_concept(a.values[0], a.by, a.note)}' in the list")
+    elif a.action == "import":
+        print(f"{store.import_concepts(a.values[0], a.by)} concepts added "
+              f"({len(store.concepts())} in the list)")
+    elif a.action == "rename":
+        store.rename_concept(*a.values, annotator=a.by)
+    elif a.action == "delete":
+        store.delete_concept(a.values[0], a.by)
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Annotate word-spotting clusters.")
     ap.add_argument("--dir", default="annotations",
@@ -930,8 +1218,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("import", help="import a run_spotting() output folder")
     p.add_argument("out_dir"); p.add_argument("--image_dir"); p.add_argument("--run_id")
     p = sub.add_parser("list", help="list clusters")
-    p.add_argument("--status", choices=STATUSES); p.add_argument("--kind", choices=KINDS)
-    p.add_argument("--unnamed", action="store_true", help="labelled clusters without a name")
+    p.add_argument("--status", choices=STATUSES)
+    p.add_argument("--concept", help="only clusters assigned to this concept")
     p = sub.add_parser("show", help="write a cluster sheet image")
     p.add_argument("cluster", type=int); p.add_argument("--out")
     p.add_argument("--no_context", action="store_true")
@@ -942,16 +1230,25 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--device", help="cpu / cuda (default: cuda if available)")
     p.add_argument("--lexicon", help="optional file of known names, one per line")
     p.add_argument("--recompute", action="store_true", help="read every word again")
-    p = sub.add_parser("label", help="define a cluster as concept or signifier")
-    p.add_argument("cluster", type=int); p.add_argument("kind", choices=KINDS)
-    p.add_argument("name", nargs="?",
-                   help="type a name to set it by hand; omit to use the automatic name")
-    p.add_argument("--no_auto", action="store_true",
-                   help="do not use the automatic name (leave the cluster unnamed)")
+    p = sub.add_parser("assign", help="assign a cluster to a concept (its value becomes "
+                                      "a signifier of that concept)")
+    p.add_argument("cluster", type=int)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--concept", help="a concept already in the list")
+    g.add_argument("--new", metavar="CONCEPT", help="define a new concept and assign to it")
+    p.add_argument("--value", help="the signifier value; omit to use the automatic name")
     p.add_argument("--note"); p.add_argument("--by", required=True)
-    p = sub.add_parser("name", help="add or change the name of a labelled cluster by hand")
-    p.add_argument("cluster", type=int); p.add_argument("name", nargs="?",
-                                                        help="omit to clear the name")
+    p = sub.add_parser("value", help="correct the value (signifier) of an assigned cluster")
+    p.add_argument("cluster", type=int); p.add_argument("value")
+    p.add_argument("--by", required=True)
+    p = sub.add_parser("unassign", help="send an assigned cluster back to pending")
+    p.add_argument("cluster", type=int); p.add_argument("--by", required=True)
+    p = sub.add_parser("reset", help="clear every assignment made so far (backup kept)")
+    p.add_argument("--concepts", choices=("annotator", "all", "keep"), default="annotator",
+                   help="concepts to drop from the list: added during annotation "
+                        "(default; the imported dictionary stays), all, or keep")
+    p.add_argument("--this_run", action="store_true", help="only the run given by --run / latest")
+    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     p.add_argument("--by", required=True)
     p = sub.add_parser("remove", help="reject a cluster")
     p.add_argument("cluster", type=int); p.add_argument("--reason")
@@ -990,6 +1287,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("cluster", type=int); p.add_argument("--no_remove", action="store_true")
     p.add_argument("--min_z", type=float, default=1.5); p.add_argument("--margin", type=float, default=0.5)
     p.add_argument("--by", required=True)
+    p = sub.add_parser("concepts", help="the concept list: list / add / import / rename / delete")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=("list", "add", "import", "rename", "delete"))
+    p.add_argument("values", nargs="*",
+                   help="add NAME | import FILE | rename OLD NEW | delete NAME")
+    p.add_argument("--note"); p.add_argument("--by")
     sub.add_parser("progress", help="counts per status and kind")
     p = sub.add_parser("export", help="export decisions (.csv or .jsonld)")
     p.add_argument("path"); p.add_argument("--base_uri", default="")
@@ -1001,11 +1304,24 @@ def main(argv: list[str] | None = None) -> None:
         if a.cmd == "import":
             print(f"imported run '{store.import_run(a.out_dir, a.image_dir, a.run_id)}'")
             return
+        if a.cmd == "concepts":
+            _concepts_command(store, a)
+            return
+        if a.cmd == "reset":
+            scope = _default_run(store, a.run) if a.this_run else None
+            if not a.yes and input(f"Clear all assignments of {scope or 'every run'} and "
+                                   f"drop '{a.concepts}' concepts? [y/N] ").lower() != "y":
+                print("nothing changed")
+                return
+            r = store.reset(a.by, scope, a.concepts)
+            print(f"{r['clusters']} clusters back to unassigned, {r['concepts_removed']} "
+                  f"concepts dropped, {r['concepts_left']} left; backup in {r['backup']}")
+            return
         run = _default_run(store, a.run)
         # the CLI uses cluster numbers as shown in clusters.csv / clusters.jpg
         cid = store.cluster_id(run, a.cluster) if hasattr(a, "cluster") else None
         if a.cmd == "list":
-            for c in store.list_clusters(run, a.status, a.kind, a.unnamed):
+            for c in store.list_clusters(run, a.status, concept=a.concept):
                 z = f"z {c['best_z']:.1f}" if c["best_z"] is not None else "new  "
                 print(f"#{c['number']:<4} {c['status']:<9} {c['size']:>3} occ / "
                       f"{c['n_pages']} pages  {z}  {store.label_text(c)}")
@@ -1030,11 +1346,16 @@ def main(argv: list[str] | None = None) -> None:
             print(store.show(nxt)["number"] if nxt else "no pending clusters")
         elif a.cmd == "auto":
             _auto_command(store, run, a)
-        elif a.cmd == "label":
-            store.label(cid, a.kind, a.name, a.by, a.note, use_auto=not a.no_auto)
+        elif a.cmd == "assign":
+            concept = store.assign(cid, a.new or a.concept, a.by, value=a.value, note=a.note,
+                                   new=a.new is not None)
+            if a.new:
+                print(f"new concept '{concept}' added to the list")
             print(f"cluster {a.cluster}: {store.label_text(store.show(cid))}")
-        elif a.cmd == "name":
-            store.name(cid, a.name, a.by)
+        elif a.cmd == "value":
+            store.set_value(cid, a.value, a.by)
+        elif a.cmd == "unassign":
+            store.unassign(cid, a.by)
         elif a.cmd == "remove":
             store.remove(cid, a.by, a.reason)
         elif a.cmd == "restore":
@@ -1063,7 +1384,7 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 n = store.export_csv(a.path, run, a.include_removed)
             print(f"{n} occurrences written to {a.path}")
-    except (AnnotationError, ImportError) as e:
+    except (AnnotationError, ImportError, FileNotFoundError) as e:
         raise SystemExit(f"error: {e}")
     finally:
         store.close()
