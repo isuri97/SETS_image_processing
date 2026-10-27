@@ -44,7 +44,7 @@ if str(HERE) not in sys.path:                    # sibling modules, however the 
 
 import recognition                               # noqa: E402
 import review                                    # noqa: E402
-from annotation import AnnotationError, ClusterStore   # noqa: E402
+from annotation.annotation import AnnotationError, ClusterStore   # noqa: E402
 
 # Full-width buttons and images: newer Streamlit uses width="stretch",
 # older versions use_container_width=True (since removed in favour of width).
