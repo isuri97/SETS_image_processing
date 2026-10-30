@@ -39,6 +39,9 @@ Results are written into the image folder:
 
     results/<image>/                 marks: overlay, marks-only, text-only, brace crops, result.json,
                                      symbols.csv (one row per symbol and brace line)
+    results/symbols.csv              the symbols of ALL pages in one self-contained file:
+                                     source photo, its size, every box in original-photo
+                                     and sheet coordinates, column, attributes, run settings
     results/<image>/words/           words: within_<image>.csv/.jpg, clusters.csv/.jpg, clusters_overlay.jpg
     results/cross/<a>__<b>/          words shared by two pages (--cross next/all)
     results/folder/                  --cross folder:
@@ -54,7 +57,6 @@ Results are written into the image folder:
         3_clusters/clusters.csv            every occurrence (page, token, box)
         3_clusters/clusters.jpg            crops of the strongest clusters
         3_clusters/pages/<image>.jpg       each page with the final cluster numbers
-        symbols.csv                        the symbols.csv of all pages in one file
         page_images/<image>.png            the pages the words were spotted on, in one folder:
                                            the IMAGE_DIR for the annotation app
         page_summary.csv                   per page: groups found, how many also elsewhere
@@ -508,7 +510,6 @@ def run_folder(images: list[Path], out_root: Path, mod, clean: bool, params, wit
     def write():
         mod.write_clusters(d3 / "clusters.csv", clusters)
         linked = add_symbols(d3 / "clusters.csv", out_root, original=not clean)
-        merge_symbols([P.name for P in pages], out_root, out / "symbols.csv", original=not clean)
         # the annotation app crops words from these, so they must be the images the boxes refer to
         (out / "page_images").mkdir(exist_ok=True)
         for image in images:
@@ -687,6 +688,8 @@ def run_batch(folder: str | Path, words: bool = True, spotting_module: str = "cr
               f"({len(usable) * (len(usable) - 1) // 2} page pairs) ...")
         folder_res = run_folder(usable, out_root, mod, clean, spotting_params, within_params, search)
 
+    n = merge_symbols([p.stem for p in usable], out_root, out_root / "symbols.csv")
+    print(f"{n} symbol rows of {len(usable)} pages in {out_root / 'symbols.csv'}")
     print(write_summary(merged, cross_rows, out_root / "summary.txt", time.perf_counter() - t0, folder_res))
     print(f"Results in {out_root}")
 
