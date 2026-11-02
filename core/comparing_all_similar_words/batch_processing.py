@@ -47,6 +47,18 @@ Pipeline
        z_ctx = z + `context_weight` x clip(support, 0, `context_cap`)
    and acceptance uses z_ctx.
 
+Memory
+------
+Memory grows with the number of pages, so per-page storage is kept small:
+  - each page image is held JPEG-encoded and decoded only for drawing;
+  - candidate crops used for HOG are freed once features are computed;
+  - display crops are stored as small thumbnails;
+  - HOG block-column sequences are computed only if `hog_dtw_weight` > 0;
+  - features and score matrices are float32;
+  - the cluster montage image is capped at `max_montage_clusters` clusters
+    (clusters.csv still lists every cluster).
+Set `log_memory=True` (needs psutil) to print resident memory per stage.
+
 Multi-page run
 --------------
 For N pages the pipeline runs
@@ -77,6 +89,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
+import os
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
@@ -93,6 +107,8 @@ from core.comparison_of_two_documents.experiment_1.word_spotting import SpotPara
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+
+THUMB_H, THUMB_W = 70, 260            # display-crop size (matches _raw_tile)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,9 +148,9 @@ class Candidate:
     tid: str                          # e.g. "c1_l9_t6[0:3]"
     parent: str                       # e.g. "c1_l9_t6"
     box: Box                          # page coordinates of the span
-    crop: np.ndarray                  # normalised crop fed to HOG
+    crop: np.ndarray | None           # normalised crop fed to HOG (freed after)
     seq: np.ndarray                   # column-profile sequence fed to DTW
-    raw: np.ndarray                   # original tight crop, for display only
+    raw: np.ndarray                   # thumbnail of the tight crop, display only
     feat: np.ndarray | None = None
     hseq: np.ndarray | None = None    # HOG block-column sequence (HOG-DTW)
     is_full: bool = False             # True if the span is the whole token
@@ -143,9 +159,38 @@ class Candidate:
 @dataclass
 class Page:
     name: str
-    img: np.ndarray
+    jpg: np.ndarray                   # JPEG-encoded page, decoded only for drawing
     unit: float                       # line pitch in px
     cands: list[Candidate] = field(default_factory=list)
+
+    @property
+    def img(self) -> np.ndarray:
+        """Decoded colour page (a fresh copy on every access)."""
+        return cv2.imdecode(self.jpg, cv2.IMREAD_COLOR)
+
+
+# --------------------------------------------------------------------------- #
+# Memory helpers
+# --------------------------------------------------------------------------- #
+def log_rss(tag: str, enabled: bool) -> None:
+    """Print the resident memory of this process (needs psutil)."""
+    if not enabled:
+        return
+    try:
+        import psutil
+    except ImportError:
+        return
+    gb = psutil.Process(os.getpid()).memory_info().rss / 2 ** 30
+    print(f"  [mem] {tag}: {gb:.2f} GB")
+
+
+def _thumb(img: np.ndarray, h: int = THUMB_H, w: int = THUMB_W) -> np.ndarray:
+    """Downscale a crop to fit within h x w (never upscales)."""
+    s = min(1.0, h / img.shape[0], w / img.shape[1])
+    if s == 1.0:
+        return img.copy()             # copy so the page array can be freed
+    return cv2.resize(img, (max(1, int(img.shape[1] * s)), max(1, int(img.shape[0] * s))),
+                      interpolation=cv2.INTER_AREA)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,8 +274,11 @@ def expand_token(gray: np.ndarray, b: Box, tid: str, unit: float,
         out.append(Candidate(
             tid=tid if full else f"{tid}[{x0}:{x1}]", parent=tid,
             box=Box(b.x0 + x0, b.y0, b.x0 + x1, b.y1),
-            crop=to_canvas(word), seq=column_features(word), raw=tight,
-            hseq=hog_column_sequence(word), is_full=full))
+            crop=to_canvas(word),
+            seq=np.asarray(column_features(word), np.float32),
+            raw=_thumb(tight),
+            hseq=hog_column_sequence(word) if cp.hog_dtw_weight > 0 else None,
+            is_full=full))
     return out
 
 
@@ -241,12 +289,16 @@ def load_page(image_path: str, cp: CrossParams, sp: SpotParams) -> Page:
               for c, col in enumerate(columns, 1)
               for l, line in enumerate(col.lines, 1)
               for t, b in enumerate(line.tokens, 1)]
-    page = Page(Path(image_path).stem, img, 0.0)
-    if not tokens:
-        return page
-    page.unit = float(np.median([b.height for _, b in tokens]))
-    for tid, b in tokens:
-        page.cands += expand_token(gray, b, tid, page.unit, cp, sp)
+    # keep the segmented image (boxes refer to it) but only in compressed form
+    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise RuntimeError(f"could not encode {image_path}")
+    page = Page(Path(image_path).stem, jpg, 0.0)
+    if tokens:
+        page.unit = float(np.median([b.height for _, b in tokens]))
+        for tid, b in tokens:
+            page.cands += expand_token(gray, b, tid, page.unit, cp, sp)
+    del img, gray, columns, tokens
     return page
 
 
@@ -254,19 +306,21 @@ def load_page(image_path: str, cp: CrossParams, sp: SpotParams) -> Page:
 # 4-6. Matching
 # --------------------------------------------------------------------------- #
 def size_mask(A: Page, B: Page, cp: CrossParams) -> np.ndarray:
+    """True where the (normalised) box sizes of two candidates are similar:
+    exp(-||log-size difference||) >= size_shortlist."""
     def logsize(p):
         return np.array([[np.log(c.box.width / p.unit), np.log(c.box.height / p.unit)]
-                         for c in p.cands])
+                         for c in p.cands], np.float32)
     la, lb = logsize(A), logsize(B)
-    d = np.linalg.norm(la[:, None, :] - lb[None, :, :], axis=2)
-    return np.exp(-d) >= cp.size_shortlist
+    d = np.hypot(la[:, None, 0] - lb[None, :, 0], la[:, None, 1] - lb[None, :, 1])
+    return d <= -np.log(cp.size_shortlist)
 
 
 def _token_max(cos: np.ndarray, ra: np.ndarray, rb: np.ndarray, n_a: int, n_b: int):
     """Collapse a candidate-level matrix to tokens: best entry per token pair,
     plus the candidate indices (i, j) that achieved it."""
-    T = np.full((n_a, n_b), -1.0)
-    arg = np.zeros((n_a, n_b, 2), int)
+    T = np.full((n_a, n_b), -1.0, np.float32)
+    arg = np.zeros((n_a, n_b, 2), np.int32)
     cols_of = [np.flatnonzero(rb == q) for q in range(n_b)]
     for p in range(n_a):
         rows = np.flatnonzero(ra == p)
@@ -288,7 +342,8 @@ def prepare_features(pages: list[Page], cp: CrossParams, sp: SpotParams,
                      hp: HogPlusParams = HogPlusParams()) -> None:
     """Fit feature statistics (HOG centring or whitening, PCA of HOG
     sequences) on the candidates of all pages together, so every pairwise
-    comparison uses the same feature space."""
+    comparison uses the same feature space. Crops are freed afterwards and
+    features stored as float32."""
     cands = [c for P in pages for c in P.cands]
     if cp.whiten:
         whitened_hog(cands, hp)
@@ -296,6 +351,12 @@ def prepare_features(pages: list[Page], cp: CrossParams, sp: SpotParams,
         compute_hog(cands, sp)
     if cp.hog_dtw_weight > 0:
         project_sequences(cands, hp)
+    for c in cands:
+        c.crop = None                                    # only needed for HOG
+        c.feat = np.asarray(c.feat, np.float32)
+        if c.hseq is not None:
+            c.hseq = np.asarray(c.hseq, np.float32)
+    gc.collect()
 
 
 def pair_scores(A: Page, B: Page, cp: CrossParams) -> dict[str, np.ndarray]:
@@ -303,19 +364,23 @@ def pair_scores(A: Page, B: Page, cp: CrossParams) -> dict[str, np.ndarray]:
     combination: every component is globally standardised (DTW distances
     negated, so higher = more similar) and averaged with its weight."""
     fa = np.stack([c.feat for c in A.cands]); fb = np.stack([c.feat for c in B.cands])
-    out = {"cos": fa @ fb.T}
-    parts = [(cp.hog_weight, out["cos"])]
-    out["dtw"] = np.full_like(out["cos"], np.nan)
+    out = {"cos": (fa @ fb.T).astype(np.float32)}
+    del fa, fb
+    total = 0.0
+    score = np.zeros_like(out["cos"])
+    if cp.hog_weight > 0:
+        score += cp.hog_weight * _gz(out["cos"]); total += cp.hog_weight
+    out["dtw"] = None
     if cp.dtw_weight > 0:
-        out["dtw"] = dtw_matrix(np.stack([c.seq for c in A.cands]),
-                                np.stack([c.seq for c in B.cands]))
-        parts.append((cp.dtw_weight, -out["dtw"]))
+        out["dtw"] = np.asarray(dtw_matrix(np.stack([c.seq for c in A.cands]),
+                                           np.stack([c.seq for c in B.cands])), np.float32)
+        score -= cp.dtw_weight * _gz(out["dtw"]); total += cp.dtw_weight
     if cp.hog_dtw_weight > 0:
-        out["hog_dtw"] = dtw_matrix(np.stack([c.hseq for c in A.cands]),
-                                    np.stack([c.hseq for c in B.cands]))
-        parts.append((cp.hog_dtw_weight, -out["hog_dtw"]))
-    total = sum(w for w, _ in parts if w > 0)
-    out["score"] = sum(w * _gz(m) for w, m in parts if w > 0) / total
+        hd = np.asarray(dtw_matrix(np.stack([c.hseq for c in A.cands]),
+                                   np.stack([c.hseq for c in B.cands])), np.float32)
+        score -= cp.hog_dtw_weight * _gz(hd); total += cp.hog_dtw_weight
+        del hd
+    out["score"] = score / total
     return out
 
 
@@ -333,13 +398,20 @@ def token_scores(A: Page, B: Page, S: np.ndarray, cp: CrossParams,
     -inf in T (never a match) and NaN in U (left out of the background)."""
     a_ids = list(dict.fromkeys(c.parent for c in A.cands))
     b_ids = list(dict.fromkeys(c.parent for c in B.cands))
-    ra = np.array([a_ids.index(c.parent) for c in A.cands])
-    rb = np.array([b_ids.index(c.parent) for c in B.cands])
+    a_idx = {t: k for k, t in enumerate(a_ids)}
+    b_idx = {t: k for k, t in enumerate(b_ids)}
+    ra = np.array([a_idx[c.parent] for c in A.cands])
+    rb = np.array([b_idx[c.parent] for c in B.cands])
     U, _ = _token_max(S, ra, rb, len(a_ids), len(b_ids))
     wa = np.array([c.box.width >= cp.min_match_lines * A.unit for c in A.cands])
     wb = np.array([c.box.width >= cp.min_match_lines * B.unit for c in B.cands])
-    allowed = size_mask(A, B, cp) & wa[:, None] & wb[None, :]
-    T, arg = _token_max(np.where(allowed, S, -np.inf), ra, rb, len(a_ids), len(b_ids))
+    allowed = size_mask(A, B, cp)
+    allowed &= wa[:, None]
+    allowed &= wb[None, :]
+    masked = np.where(allowed, S, np.float32(-np.inf))
+    del allowed
+    T, arg = _token_max(masked, ra, rb, len(a_ids), len(b_ids))
+    del masked
     if same_page:
         np.fill_diagonal(T, -np.inf)
         np.fill_diagonal(U, np.nan)
@@ -369,7 +441,7 @@ def context_support(Zn: np.ndarray, a_ids: list[str], b_ids: list[str],
                     reach: int) -> np.ndarray:
     """support[p, q] = best Zn over neighbour pairs on the same side, with
     offsets d1, d2 in 1..reach (tolerates an extra token on one page)."""
-    support = np.full(Zn.shape, -np.inf)
+    support = np.full(Zn.shape, -np.inf, np.float32)
     for d1 in range(1, reach + 1):
         la, ra = _reading_neighbours(a_ids, d1)
         for d2 in range(1, reach + 1):
@@ -377,7 +449,7 @@ def context_support(Zn: np.ndarray, a_ids: list[str], b_ids: list[str],
             for na, nb in ((la, lb), (ra, rb)):
                 vals = Zn[np.ix_(np.maximum(na, 0), np.maximum(nb, 0))]
                 vals = np.where((na[:, None] >= 0) & (nb[None, :] >= 0), vals, -np.inf)
-                support = np.maximum(support, vals)
+                np.maximum(support, vals, out=support)
     return support
 
 
@@ -388,11 +460,14 @@ def match(A: Page, B: Page, cp: CrossParams) -> list[dict]:
     same = B is A
     P = pair_scores(A, B, cp)
     T, U, arg = token_scores(A, B, P["score"], cp, same_page=same)
+    del P["score"]                                        # largest matrix, done
     z = _reciprocal_z(T, U)
     a_ids = list(dict.fromkeys(c.parent for c in A.cands))
     b_ids = list(dict.fromkeys(c.parent for c in B.cands))
     zn = np.nan_to_num(_reciprocal_z(U, U), nan=-np.inf)
+    del U
     support = context_support(zn, a_ids, b_ids, cp.context_reach)
+    del zn
     zc = z + cp.context_weight * np.clip(support, 0, cp.context_cap)
 
     k = cp.top_k_within if same else cp.top_k
@@ -408,9 +483,10 @@ def match(A: Page, B: Page, cp: CrossParams) -> list[dict]:
         if (q in top_a[p] and p in top_b[:, q]
                 and s >= best_a[p] - cp.margin and s >= best_b[q] - cp.margin):
             i, j = arg[p, q]
+            dtw = float("nan") if P["dtw"] is None else float(P["dtw"][i, j])
             pairs.append(dict(i=int(i), j=int(j), z=float(zc[p, q]), z_base=float(z[p, q]),
                               support=float(max(support[p, q], 0.0)), score=float(s),
-                              cos=float(P["cos"][i, j]), dtw=float(P["dtw"][i, j])))
+                              cos=float(P["cos"][i, j]), dtw=dtw))
     return sorted(pairs, key=lambda d: -d["z"])
 
 
@@ -486,8 +562,8 @@ def cluster_matches(results: list[tuple[Page, Page, list[dict]]],
 # --------------------------------------------------------------------------- #
 # Visualisation and output
 # --------------------------------------------------------------------------- #
-def _raw_tile(c: Candidate, label: str, h: int = 70, w: int = 260) -> np.ndarray:
-    """Original crop scaled to fit h x w on white, with a label above."""
+def _raw_tile(c: Candidate, label: str, h: int = THUMB_H, w: int = THUMB_W) -> np.ndarray:
+    """Thumbnail crop scaled to fit h x w on white, with a label above."""
     img = c.raw
     s = min(h / img.shape[0], w / img.shape[1])
     img = cv2.resize(img, (max(1, int(img.shape[1] * s)), max(1, int(img.shape[0] * s))))
@@ -505,9 +581,10 @@ def cp_context_bonus(p: dict) -> float:
     return p["z"] - p.get("z_base", p["z"])
 
 
-def draw_pairs(A: Page, B: Page, pairs: list[dict]) -> np.ndarray:
+def draw_pairs(A: Page, B: Page, pairs: list[dict], max_rows: int = 300) -> np.ndarray:
+    """Matched crops side by side (strongest first, at most `max_rows`)."""
     rows = []
-    for p in pairs:
+    for p in pairs[:max_rows]:
         a = _raw_tile(A.cands[p["i"]], f"{A.name}:{A.cands[p['i']].tid}")
         b = _raw_tile(B.cands[p["j"]], f"{B.name}:{B.cands[p['j']].tid}")
         info = np.full((a.shape[0], 150, 3), 255, np.uint8)
@@ -524,9 +601,11 @@ def draw_pairs(A: Page, B: Page, pairs: list[dict]) -> np.ndarray:
 
 def draw_side_by_side(A: Page, B: Page, pairs: list[dict], height: int = 2000) -> np.ndarray:
     """Pairs sharing the same A span get one colour and number on both pages."""
-    sa, sb = height / A.img.shape[0], height / B.img.shape[0]
-    pa = cv2.resize(A.img, None, fx=sa, fy=sa)
-    pb = cv2.resize(B.img, None, fx=sb, fy=sb)
+    ia, ib = A.img, B.img
+    sa, sb = height / ia.shape[0], height / ib.shape[0]
+    pa = cv2.resize(ia, None, fx=sa, fy=sa, interpolation=cv2.INTER_AREA)
+    pb = cv2.resize(ib, None, fx=sb, fy=sb, interpolation=cv2.INTER_AREA)
+    del ia, ib
     keys = list(dict.fromkeys(p["i"] for p in pairs))
     colours = dict(zip(keys, group_palette(len(keys))))
     for p in pairs:
@@ -539,10 +618,12 @@ def draw_side_by_side(A: Page, B: Page, pairs: list[dict], height: int = 2000) -
     return cv2.hconcat([pa, np.full((height, 30, 3), 255, np.uint8), pb])
 
 
-def draw_clusters(clusters: list[Cluster], per_row: int = 6) -> np.ndarray:
-    """One block per cluster: its occurrences (original crops) side by side."""
+def draw_clusters(clusters: list[Cluster], per_row: int = 6,
+                  max_clusters: int = 150) -> np.ndarray:
+    """One block per cluster: its occurrences side by side (largest clusters
+    first, at most `max_clusters` so the image stays a manageable size)."""
     blocks = []
-    for n, cl in enumerate(clusters, 1):
+    for n, cl in enumerate(clusters[:max_clusters], 1):
         tiles = [_raw_tile(P.cands[i], f"{P.name}:{P.cands[i].parent}", w=200)
                  for P, i in cl.members]
         while len(tiles) % per_row:
@@ -564,8 +645,10 @@ def draw_clusters(clusters: list[Cluster], per_row: int = 6) -> np.ndarray:
 def _mark_clusters(P: Page, clusters: list[Cluster], palette: list, height: int) -> np.ndarray:
     """One page, resized to `height`, with every cluster occurrence boxed in
     the cluster's colour and numbered with the cluster index."""
-    s = height / P.img.shape[0]
-    canvas = cv2.resize(P.img, None, fx=s, fy=s)
+    img = P.img
+    s = height / img.shape[0]
+    canvas = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    del img
     for n, (cl, col) in enumerate(zip(clusters, palette), 1):
         for Q, i in cl.members:
             if Q is not P:
@@ -631,6 +714,8 @@ def run_spotting(images: str | Path | list[str | Path],
                  cp: CrossParams | None = None,
                  within: bool = True, cross: bool = True,
                  max_overlay_pages: int = 4,
+                 max_montage_clusters: int = 150,
+                 log_memory: bool = False,
                  verbose: bool = True) -> dict:
     """Find similar words within each page and between every pair of pages.
 
@@ -665,12 +750,15 @@ def run_spotting(images: str | Path | list[str | Path],
         pages.append(P)
         if verbose:
             print(f"  {len(P.cands)} candidates, line pitch {P.unit:.0f}px")
+        gc.collect()
+        log_rss(f"after {path.name}", log_memory)
     if not pages:
         raise RuntimeError("no usable pages")
     if len(pages) == 1:
         within, cross = True, False
 
     prepare_features(pages, cp, sp)                       # pooled over all pages
+    log_rss("after feature extraction", log_memory)
 
     # 4-7. within-page and between-page matching
     results = []
@@ -680,8 +768,10 @@ def run_spotting(images: str | Path | list[str | Path],
             results.append((P, P, pairs))
             write_matches(out / f"within_{P.name}.csv", P, P, pairs)
             cv2.imwrite(str(out / f"within_{P.name}.jpg"), draw_pairs(P, P, pairs))
+            gc.collect()
             if verbose:
                 print(f"{P.name}: {len(pairs)} matches within the page")
+            log_rss(f"after within {P.name}", log_memory)
     if cross:
         todo = list(combinations(pages, 2))
         for n, (A, B) in enumerate(todo, 1):
@@ -690,14 +780,16 @@ def run_spotting(images: str | Path | list[str | Path],
             stem = f"cross_{A.name}__{B.name}"
             write_matches(out / f"{stem}.csv", A, B, pairs)
             cv2.imwrite(str(out / f"{stem}.jpg"), draw_pairs(A, B, pairs))
+            gc.collect()
             if verbose:
                 print(f"[{n}/{len(todo)}] {A.name} <-> {B.name}: {len(pairs)} matches")
+            log_rss(f"after {A.name} <-> {B.name}", log_memory)
 
     # clusters over the whole folder
     clusters = cluster_matches(results)
     write_summary(out / "summary.csv", results)
     write_clusters(out / "clusters.csv", clusters)
-    cv2.imwrite(str(out / "clusters.jpg"), draw_clusters(clusters))
+    cv2.imwrite(str(out / "clusters.jpg"), draw_clusters(clusters, max_clusters=max_montage_clusters))
     palette = group_palette(len(clusters))
     for P in pages:
         cv2.imwrite(str(out / f"clusters_{P.name}.jpg"),
@@ -754,6 +846,10 @@ def main() -> None:
                     help="skip matching between pages")
     ap.add_argument("--max_overlay_pages", type=int, default=4,
                     help="write the all-pages overlay only up to this many pages")
+    ap.add_argument("--max_montage_clusters", type=int, default=150,
+                    help="clusters drawn in clusters.jpg (the CSV lists all)")
+    ap.add_argument("--log_memory", action="store_true",
+                    help="print resident memory after each stage (needs psutil)")
     ap.add_argument("--top_k_within", type=int, default=CrossParams.top_k_within)
     ap.add_argument("--z_threshold", type=float, default=CrossParams.z_threshold)
     ap.add_argument("--margin", type=float, default=CrossParams.margin)
@@ -776,7 +872,9 @@ def main() -> None:
                      hog_weight=a.hog_weight, hog_dtw_weight=a.hog_dtw_weight,
                      top_k_within=a.top_k_within)
     run_spotting(a.inputs, a.out_dir, cp, within=a.within, cross=a.cross,
-                 max_overlay_pages=a.max_overlay_pages)
+                 max_overlay_pages=a.max_overlay_pages,
+                 max_montage_clusters=a.max_montage_clusters,
+                 log_memory=a.log_memory)
 
 
 # --------------------------------------------------------------------------- #
@@ -786,11 +884,13 @@ def main() -> None:
 HERE = Path(__file__).resolve().parent
 
 SETTINGS = dict(
-    images="/home/isuri/PycharmProjects/SETS_image_processing/data2",  # folder, file, or list
+    images="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2",  # folder, file, or list
     out_dir=HERE / "result",              # where results are written
     within=True,                          # similar words inside each page
     cross=True,                           # similar words between every pair of pages
     max_overlay_pages=4,                  # all-pages overlay only for small runs
+    max_montage_clusters=150,             # clusters drawn in clusters.jpg
+    log_memory=True,                      # print memory per stage (needs psutil)
     params=CrossParams(
         z_threshold=3.25,                 # higher = fewer, more reliable matches
         whiten=True,                      # whitened HOG (best configuration)
@@ -807,4 +907,6 @@ if __name__ == "__main__":
     else:                                 # no arguments -> SETTINGS above
         run_spotting(SETTINGS["images"], SETTINGS["out_dir"], SETTINGS["params"],
                      within=SETTINGS["within"], cross=SETTINGS["cross"],
-                     max_overlay_pages=SETTINGS["max_overlay_pages"])
+                     max_overlay_pages=SETTINGS["max_overlay_pages"],
+                     max_montage_clusters=SETTINGS["max_montage_clusters"],
+                     log_memory=SETTINGS["log_memory"])

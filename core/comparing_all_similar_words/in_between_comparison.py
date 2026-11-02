@@ -97,7 +97,7 @@ import cv2
 import numpy as np
 
 from core.comparison_of_two_documents.experiment_1.segment_manuscript import Box, Params, _runs, binarise, group_palette, segment
-from core.comparison_of_two_documents.experiment_1 import normalise_word, to_canvas
+from core.comparison_of_two_documents.experiment_1.handwriting_norm import normalise_word, to_canvas
 from core.comparison_of_two_documents.experiment_2.hog_plus import (HogPlusParams, hog_column_sequence, project_sequences,
                                                                     whitened_hog)
 from core.comparison_of_two_documents.experiment_1.profile_dtw import column_features, dtw_matrix
