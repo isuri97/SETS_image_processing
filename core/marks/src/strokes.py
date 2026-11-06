@@ -39,12 +39,38 @@ def path_length(ink: np.ndarray, axis: str = "vertical") -> np.ndarray:
     return total if axis == "vertical" else total.T
 
 
-def line_spacing(ink: np.ndarray, lo: int = 30, hi: int = 160) -> int:
-    """Dominant text line pitch in pixels, from the row-profile autocorrelation."""
+def line_spacing(ink: np.ndarray, lo: int = 8, hi_frac: float = 0.12, sub_ratio: float = 0.25) -> int:
+    """Text line pitch in pixels, from the row-profile autocorrelation.
+
+    The autocorrelation of the ink-per-row profile peaks at the line pitch
+    and at its multiples. In a register the entries repeat too (two or three
+    lines each), so the strongest peak may be the entry pitch rather than the
+    line pitch. The strongest peak is therefore taken first, and replaced by
+    the peak near a half or a third of it when that one is clearly present
+    (at least `sub_ratio` of its height). The search runs from `lo` pixels to
+    `hi_frac` of the page height, so it works at any image resolution.
+    """
+    from scipy.signal import find_peaks
+
     prof = ink.sum(axis=1).astype(np.float64)
     prof -= prof.mean()
     ac = np.correlate(prof, prof, "full")[len(prof) - 1 :]
-    return int(np.argmax(ac[lo:hi]) + lo)
+    if ac[0] <= 0:
+        return 40  # an empty page: any value will do
+    ac /= ac[0]
+    hi = max(lo + 3, int(hi_frac * len(prof)))
+    peaks, _ = find_peaks(ac[:hi], prominence=0.02)
+    peaks = peaks[peaks >= lo]
+    if not len(peaks):
+        return int(np.argmax(ac[lo:hi]) + lo)
+    best = int(peaks[np.argmax(ac[peaks])])
+    for k in (3, 2):  # prefer the smallest clear fundamental
+        near = peaks[np.abs(peaks - best / k) <= 0.15 * best / k]
+        if len(near):
+            cand = int(near[np.argmax(ac[near])])
+            if ac[cand] > 0 and ac[cand] >= sub_ratio * ac[best]:
+                return cand
+    return best
 
 
 def stroke_width(ink: np.ndarray) -> float:

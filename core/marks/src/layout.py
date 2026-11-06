@@ -70,14 +70,21 @@ def gutter(ink: np.ndarray, ls: int) -> int:
     return _gap_in(ink, ls, 0, ink.shape[1], max_ratio=np.inf)
 
 
-def _gap_in(ink: np.ndarray, ls: int, x0: int, x1: int, max_ratio: float = 0.6) -> int | None:
+def _gap_in(ink: np.ndarray, ls: int, x0: int, x1: int, max_ratio: float = 0.6,
+            against: str = "both") -> int | None:
     """x of the emptiest vertical band in the middle 35-65 % of [x0, x1).
 
-    Returns None if that band is not clearly emptier than the text on
-    *both* sides of it (its ink is above `max_ratio` times the median ink
-    of either side), i.e. the range holds a single column. Comparing with
-    each side, rather than demanding a near-empty band, keeps the gap when
-    a few long lines run into it.
+    Returns None if that band is not clearly emptier than the text beside
+    it (its ink is above `max_ratio` times the median ink of the side), i.e.
+    the range holds a single column. Comparing with the sides, rather than
+    demanding a near-empty band, keeps the gap when a few long lines run
+    into it.
+
+    against  "both": the band must be emptier than each side (used for the
+             fold of a spread, where both pages hold text);
+             "denser": it must be emptier than the fuller side only (used for
+             the gap between the two columns of a page, where one column may
+             be largely blank, e.g. filled with closing strokes).
     """
     prof = gaussian_filter1d(ink[:, x0:x1].sum(axis=0).astype(float), 0.3 * ls)
     lo, hi = int(0.35 * len(prof)), int(0.65 * len(prof))
@@ -88,7 +95,8 @@ def _gap_in(ink: np.ndarray, ls: int, x0: int, x1: int, max_ratio: float = 0.6) 
     left, right = prof[: max(1, k - margin)], prof[k + margin :]
     if len(right) == 0:
         return None
-    side = min(np.median(left), np.median(right))
+    sides = (np.median(left), np.median(right))
+    side = min(sides) if against == "both" else max(sides)
     if prof[k] > max_ratio * max(side, 1e-6):
         return None
     return x0 + k
@@ -115,7 +123,7 @@ def column_bounds(ink: np.ndarray, ls: int, pages: int | None = None,
             edges = [0, fold, w]
     bounds = []
     for a, b in zip(edges, edges[1:]):
-        g = _gap_in(ink, ls, a, b) if columns == 2 else None
+        g = _gap_in(ink, ls, a, b, against="denser") if columns == 2 else None
         bounds += [(a, g), (g, b)] if g is not None else [(a, b)]
     return bounds
 
@@ -255,7 +263,7 @@ def associate(braces: list[Brace], ink: np.ndarray, ls: int, sw: float, exclude:
         bounds = column_bounds(ink, ls)
     text = ink.copy()
     for b in braces:
-        text &= ~b.mask
+        b.region.erase(text)
     if exclude is not None:
         text &= ~exclude
     if fillers is not None:
@@ -289,7 +297,7 @@ def associate(braces: list[Brace], ink: np.ndarray, ls: int, sw: float, exclude:
                 (g.members if cov >= min_cover else g.borderline).append(line)
 
         # ---- right: the lines nearest the cusp, grown to adjacent spanned lines
-        ys, xs = np.where(b.mask)
+        ys, xs = b.region.where()
         cusp_y = int(np.median(ys[xs >= xs.max() - 2]))
         right = []
         for c in local_lines(text, x + bw, min(cx1, x + bw + int(4 * ls)), y - pad, y + bh + pad, ls):
