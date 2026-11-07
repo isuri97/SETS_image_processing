@@ -1,4 +1,4 @@
-"""Process every image in a folder: mark detection, then similar-word spotting.
+""""Process every image in a folder: mark detection, then similar-word spotting.
 
 For each image, in order:
 
@@ -72,11 +72,18 @@ symbol_relation (member, borderline or note) and symbol_line (see symbol_csv.py)
 Only images directly inside the folder are processed (not subfolders), so the
 result images are never picked up on a second run. An image that fails is
 recorded with its error message and the batch carries on.
+
+Memory: images are processed one at a time. As soon as an image is done its
+symbol rows are appended to results/symbols.csv and flushed to disk, and the
+memory it used is released (free_memory) before the next image is read. If
+the run stops, symbols.csv holds every image finished so far.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import gc
 import importlib
 import itertools
 import shutil
@@ -86,8 +93,9 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from run import process
-from symbol_csv import add_symbols, merge_symbols
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # find run.py and symbol_csv.py next to this file
+from run import process  # noqa: E402
+from symbol_csv import add_symbols, append_symbols, drop_pages, load_symbols, merge_symbols  # noqa: E402
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 MARK_KINDS = ("rule", "slash", "dash", "circle", "filler")
@@ -173,6 +181,23 @@ def _spot_counts(res: dict) -> dict:
         "word_clusters": len(clusters),
         "word_occurrences": sum(len(c.members) for c in clusters),
     }
+
+
+# --------------------------------------------------------------------------
+# memory
+# --------------------------------------------------------------------------
+def free_memory() -> None:
+    """Release the memory of the image just processed.
+
+    gc.collect() frees unreachable objects; malloc_trim then hands freed
+    memory back to the operating system (Linux, e.g. Colab), so the RAM shown
+    in use drops between images instead of staying at the last peak.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):  # not glibc (macOS, Windows): gc alone is enough
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -648,6 +673,13 @@ def run_batch(folder: str | Path, words: bool = True, spotting_module: str = "cr
     out_root.mkdir(exist_ok=True)
     images = [p for p in all_images if not (skip_done and is_done(p, out_root, per_image_words))]
 
+    # symbols of all images, written as each image finishes
+    symbols_csv = out_root / "symbols.csv"
+    if skip_done:
+        drop_pages(symbols_csv, {p.stem for p in images})  # rows of images about to be redone
+    else:
+        symbols_csv.unlink(missing_ok=True)
+
     csv_path = out_root / "timings.csv"
     earlier = []  # with --skip-done, keep the rows of earlier runs and add to them
     if skip_done and csv_path.exists():
@@ -664,10 +696,13 @@ def run_batch(folder: str | Path, words: bool = True, spotting_module: str = "cr
             writer.writerow(row)
             fh.flush()  # the CSV stays usable if the batch is interrupted
             rows.append(row)
+            if row["status"] != "failed":
+                row["symbol_rows"] = append_symbols(symbols_csv, load_symbols(out_root, image.stem))
+            free_memory()  # nothing of this image is kept in memory for the next one
             extra = f" (marks {row['marks_seconds']} s, words {row['words_seconds']} s)" \
                 if "words_seconds" in row else ""
             print(f"[{i}/{len(all_images) if not skip_done else len(images)}] {image.name}: "
-                  f"{row['status']} in {row['seconds']} s{extra}")
+                  f"{row['status']} in {row['seconds']} s{extra}, {row.get('symbol_rows', 0)} symbol rows")
 
     # one row per image: a retried image replaces its earlier row
     done = {r["image"] for r in rows}
@@ -688,8 +723,10 @@ def run_batch(folder: str | Path, words: bool = True, spotting_module: str = "cr
               f"({len(usable) * (len(usable) - 1) // 2} page pairs) ...")
         folder_res = run_folder(usable, out_root, mod, clean, spotting_params, within_params, search)
 
-    n = merge_symbols([p.stem for p in usable], out_root, out_root / "symbols.csv")
-    print(f"{n} symbol rows of {len(usable)} pages in {out_root / 'symbols.csv'}")
+    # rewrite in image order (rows were appended in processing order, and with
+    # --skip-done earlier images were kept); every row is already on disk
+    n = merge_symbols([p.stem for p in usable], out_root, symbols_csv)
+    print(f"{n} symbol rows of {len(usable)} pages in {symbols_csv}")
     print(write_summary(merged, cross_rows, out_root / "summary.txt", time.perf_counter() - t0, folder_res))
     print(f"Results in {out_root}")
 
@@ -727,8 +764,8 @@ def main() -> None:
 # (e.g. the Run button in PyCharm).
 # --------------------------------------------------------------------------
 SETTINGS = dict(
-    folder="/home/isuri/PycharmProjects/SETS_image_processing/data2",   # image folder
-    words=True,                                    # similar-word spotting per page
+    folder="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data/test",   # image folder
+    words=False,                                    # similar-word spotting per page
     spotting_root="/home/isuri/PycharmProjects/SETS_image_processing",      # project root
     spotting_module="core.comparing_all_similar_words.in_between_comparison",
     # None = CrossParams() defaults of your module; a dict changes single fields, e.g.
@@ -739,7 +776,7 @@ SETTINGS = dict(
     within_params=None,
     search="within_groups",                        # or "all_words" (see run_folder)
     clean=True,                                    # spot on the marks-free page
-    cross="folder",                                # "none", "next", "all" or "folder"
+    cross="none",                                # "none", "next", "all" or "folder"
     skip_done=False,
 )
 
@@ -749,3 +786,4 @@ if __name__ == "__main__":
         main()
     else:
         run_batch(**SETTINGS)
+

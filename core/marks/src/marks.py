@@ -1,8 +1,8 @@
 """Detectors for the non-brace marks: rules, slashes, dashes, circles, fillers.
 
 Each detector is a pixel-level test on the binary ink mask and returns `Mark`
-objects carrying a full-page mask, so marks can be erased from, or isolated
-on, the page image. Detectors run in a fixed order and every one works on the
+objects carrying the mark's pixels as a bounding-box `Region`, so marks can be
+erased from, or isolated on, the page image without a full-page mask each. Detectors run in a fixed order and every one works on the
 ink left over by the previous ones:
 
     rules -> slashes -> dashes -> circles -> fillers
@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from preprocess import Page
+from region import Region
 from strokes import path_length
 
 Box = tuple[int, int, int, int]  # x, y, w, h
@@ -28,8 +29,13 @@ class Mark:
 
     kind: str  # "rule", "slash", "dash", "circle" or "filler"
     bbox: Box
-    mask: np.ndarray  # full-page boolean image of its pixels
+    region: Region  # its pixels, cropped to their bounding box
     attrs: dict = field(default_factory=dict)
+
+    @property
+    def mask(self) -> np.ndarray:
+        """Full-page boolean image of the mark, built on demand (not stored)."""
+        return self.region.full()
 
 
 def _bbox(mask: np.ndarray) -> Box:
@@ -83,7 +89,7 @@ def detect_rules(ink: np.ndarray, ls: int, sw: float, min_len: float = 5.0) -> l
         # widen to the full stroke thickness around the fitted centre line
         band = _paste(ink.shape, np.ones_like(comp) & near, x, y) & ink
         mask |= band
-        marks.append(Mark("rule", _bbox(mask), mask, {"length_ls": round(w / ls, 1)}))
+        marks.append(Mark("rule", _bbox(mask), Region.from_full(mask), {"length_ls": round(w / ls, 1)}))
     return marks
 
 
@@ -298,7 +304,7 @@ def detect_slashes(ink: np.ndarray, faint: np.ndarray, ls: int, sw: float, min_i
             s.stamp(mask)
         x, y, w, h = _bbox(mask)
         beside = not_slash[y + int(0.2 * h) : y + int(0.8 * h), x + w : x + w + int(1.2 * ls)]
-        marks.append(Mark("slash", (x, y, w, h), mask, {
+        marks.append(Mark("slash", (x, y, w, h), Region.from_full(mask), {
             "strokes": len(members),
             "length_ls": round(max(s.length for s in members) / ls, 2),
             "angle": round(float(np.mean([s.angle for s in members]))),
@@ -341,21 +347,20 @@ def detect_dashes(ink: np.ndarray, contrast: np.ndarray, ls: int, sw: float) -> 
         # one pen stroke: straight, and nowhere thicker than about two stroke widths
         if abs(slope) > 0.35 or wavy > 0.5 * sw or thick.max() > 2.2 * sw:
             continue
-        full = _paste(ink.shape, comp, x, y)
-        other = ink & ~full
+        # every window below lies outside the dash's own box, so the ink there is "other" ink
         reach = int(0.3 * ls)
-        below = other[y + h : y + h + reach, x : x + w].any(axis=0).mean()
-        above = other[max(0, y - reach) : y, x : x + w].any(axis=0).mean()
+        below = ink[y + h : y + h + reach, x : x + w].any(axis=0).mean()
+        above = ink[max(0, y - reach) : y, x : x + w].any(axis=0).mean()
         if below > 0.2:
             continue
         # a dash stands clear of its neighbours; a broken-off piece of a letter does not
         side = int(0.12 * ls)
-        if other[y : y + h, max(0, x - side) : x].any() or other[y : y + h, x + w : x + w + side].any():
+        if ink[y : y + h, max(0, x - side) : x].any() or ink[y : y + h, x + w : x + w + side].any():
             continue
-        darkness = float(np.median(contrast[full])) / max(ink_level, 1e-6)
+        darkness = float(np.median(contrast[y : y + h, x : x + w][comp])) / max(ink_level, 1e-6)
         if darkness < 0.6:
             continue  # show-through or a stain, paler than the writing
-        marks.append(Mark("dash", (x, y, w, h), full, {
+        marks.append(Mark("dash", (x, y, w, h), Region(comp, x, y, ink.shape), {
             "length_ls": round(w / ls, 2),
             "under_flourish": bool(above > 0.5),
             "darkness": round(darkness, 2),
@@ -438,13 +443,12 @@ def detect_circles(bgr: np.ndarray, ink: np.ndarray, contrast: np.ndarray, ls: i
             continue
         if fit["error"] > max_error * sw or fit["coverage"] < min_coverage or fit["centre"] > max_centre:
             continue
-        full = _paste(ink.shape, comp, x, y)
-        darkness = float(np.median(contrast[full])) / max(ink_level, 1e-6)
+        darkness = float(np.median(contrast[y : y + h, x : x + w][comp])) / max(ink_level, 1e-6)
         if darkness < min_darkness:
             continue
-        s = float(np.median(sat[full]))
+        s = float(np.median(sat[y : y + h, x : x + w][comp]))
         medium = "pencil" if s < 0.5 * (ink_sat + paper_sat) else "ink"
-        marks.append(Mark("circle", (x, y, w, h), full, {
+        marks.append(Mark("circle", (x, y, w, h), Region(comp, x, y, ink.shape), {
             "medium": medium, "saturation": round(s, 1), "diameter_ls": round((w + h) / 2 / ls, 2),
             "coverage": round(fit["coverage"], 2), "fit_error_sw": round(fit["error"] / sw, 2),
             "darkness": round(darkness, 2),
@@ -482,21 +486,21 @@ def detect_fillers(ink: np.ndarray, contrast: np.ndarray, taken: np.ndarray,
     for comp, x, y, bw, bh, area in _components(blobs):
         if not (bh <= 0.48 * ls and 0.3 * ls <= bw <= 3.0 * ls and area >= 6 * sw * sw):
             continue
-        mask = _paste(ink.shape, comp, x, y) & free
-        if not mask.any() or np.median(contrast[mask]) < 0.6 * ink_level:
+        crop = comp & free[y : y + bh, x : x + bw]  # the blob's own ink, in its box
+        if not crop.any() or np.median(contrast[y : y + bh, x : x + bw][crop]) < 0.6 * ink_level:
             continue  # show-through, paler than the writing
-        cands.append((x, y, bw, bh, mask))
-        owner[mask] = len(cands)
+        cands.append((x, y, bw, bh, crop))
+        owner[y : y + bh, x : x + bw][crop] = len(cands)
 
     def describe(i: int) -> tuple[bool, float, int]:
         """(nothing but candidates follows, gap to the left in LS, candidate on the left or -1)."""
-        x, y, bw, bh, mask = cands[i]
+        x, y, bw, bh, _ = cands[i]
         col_lo, col_hi = next(((a, b) for a, b in bounds if a <= x + bw / 2 < b), (0, w))
         band = slice(max(0, y - int(0.1 * ls)), y + bh + int(0.1 * ls))
         stop_cols = np.where(taken[band, x + bw : col_hi].any(axis=0))[0]
         limit = x + bw + int(stop_cols.min()) if len(stop_cols) else col_hi
         after = solid[band, x + bw : limit] & (owner[band, x + bw : limit] == 0)
-        left = (solid & ~mask)[band, col_lo:x]
+        left = solid[band, col_lo:x]  # columns left of the blob, so none of its own ink
         cols = np.where(left.any(axis=0))[0]
         if len(cols) == 0:
             return not after.any(), np.inf, -1
@@ -530,8 +534,8 @@ def detect_fillers(ink: np.ndarray, contrast: np.ndarray, taken: np.ndarray,
                 grew = True
     marks = []
     for i in sorted(accepted):
-        x, y, bw, bh, mask = cands[i]
-        marks.append(Mark("filler", (x, y, bw, bh), mask,
+        x, y, bw, bh, crop = cands[i]
+        marks.append(Mark("filler", (x, y, bw, bh), Region.from_crop(crop, x, y, ink.shape),
                           {"gap_ls": round(float(info[i][1]), 2), "width_ls": round(bw / ls, 2)}))
     return marks
 
@@ -552,7 +556,7 @@ def detect_marks(page: Page, brace_mask: np.ndarray, bounds: list[tuple[int, int
         nonlocal taken
         marks.extend(found)
         for m in found:
-            taken |= m.mask
+            m.region.stamp(taken)
 
     claim(detect_rules(page.ink & ~taken, ls, sw))
     claim(detect_slashes(page.ink & ~taken, page.faint & ~taken, ls, sw))

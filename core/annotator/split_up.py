@@ -343,7 +343,7 @@ def main() -> None:
 # Run settings - used when the script is started without arguments
 # --------------------------------------------------------------------------
 SETTINGS = dict(
-    folder="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data",  # the photographs
+    folder="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data/test/new",  # the photographs
     out="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data",      # the split, cleaned pages
     gray=False,                                       # colour keeps pencil and ink apart
     debug=True,                                       # check images with the sheet and the fold
