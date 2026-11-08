@@ -22,18 +22,24 @@ import cv2
 import numpy as np
 from scipy.ndimage import binary_fill_holes
 
+from region import Region
 from strokes import path_length
 
 
 @dataclass
 class Brace:
-    """One detected brace. `mask` is a full-page boolean image of its pixels."""
+    """One detected brace. Its pixels are kept as a bounding-box `region`."""
 
     bbox: tuple[int, int, int, int]  # x, y, w, h
-    mask: np.ndarray
+    region: Region
     kind: str  # "stacked" (type A) or "traced" (type B)
     arms: int
     features: dict = field(default_factory=dict)
+
+    @property
+    def mask(self) -> np.ndarray:
+        """Full-page boolean image of the brace, built on demand (not stored)."""
+        return self.region.full()
 
     @property
     def span(self) -> tuple[int, int]:
@@ -42,20 +48,25 @@ class Brace:
 
     def right_edge(self, y0: int, y1: int) -> int:
         """Right-most brace pixel in rows [y0, y1], or the bbox edge if none."""
-        cols = np.where(self.mask[max(0, y0) : y1 + 1].any(axis=0))[0]
-        return int(cols.max()) if len(cols) else self.bbox[0] + self.bbox[2] - 1
+        r = self.region
+        r0, r1 = max(0, max(0, y0) - r.y), max(0, y1 + 1 - r.y)
+        cols = np.where(r.crop[r0:r1].any(axis=0))[0]
+        return int(cols.max()) + r.x if len(cols) else self.bbox[0] + self.bbox[2] - 1
 
 
 # --------------------------------------------------------------------------
 # feature helpers
 # --------------------------------------------------------------------------
-def _row_extents(mask: np.ndarray) -> list[tuple[int, int, int]]:
-    """(y, xmin, xmax) for every row of `mask` that has pixels."""
+def _row_extents(mask: np.ndarray, x: int = 0, y: int = 0) -> list[tuple[int, int, int]]:
+    """(y, xmin, xmax) for every row of `mask` that has pixels.
+
+    `x` and `y` are added to the result, so a crop gives page coordinates.
+    """
     ys, xs = np.where(mask)
     out = []
-    for y in np.unique(ys):
-        r = xs[ys == y]
-        out.append((int(y), int(r.min()), int(r.max())))
+    for row in np.unique(ys):
+        r = xs[ys == row]
+        out.append((int(row) + y, int(r.min()) + x, int(r.max()) + x))
     return out
 
 
@@ -115,18 +126,16 @@ def _arm_primitives(ink: np.ndarray, ls: int) -> list[dict]:
         comp = lab[y : y + h, x : x + w] == i
         if _has_hole(comp):
             continue
-        full = np.zeros_like(ink)
-        full[y : y + h, x : x + w] = comp
-        rows = _row_extents(full)
-        prims.append({"mask": full, "y0": y, "y1": y + h - 1, "rows": rows,
-                      "top_x": _end_x(rows, True), "bot_x": _end_x(rows, False)})
+        rows = _row_extents(comp, int(x), int(y))
+        prims.append({"region": Region(comp, int(x), int(y), ink.shape), "y0": y, "y1": y + h - 1,
+                      "rows": rows, "top_x": _end_x(rows, True), "bot_x": _end_x(rows, False)})
     return sorted(prims, key=lambda p: p["y0"])
 
 
 def _stands_alone(p: dict, ink: np.ndarray, ls: int, sw: float) -> bool:
     """True if a primitive has white space on both sides (cached on the dict)."""
     if "alone" not in p:
-        f = stroke_features(p["mask"], ink, ls, sw)
+        f = stroke_features(p["region"].full(), ink, ls, sw)
         p["alone"] = f["iso_left"] >= 0.6 and f["iso_right"] >= 0.6
     return p["alone"]
 
@@ -164,10 +173,13 @@ def _chain(prims: list[dict], ink: np.ndarray, ls: int, sw: float) -> list[list[
 # --------------------------------------------------------------------------
 # type B: long strokes traced through touching text
 # --------------------------------------------------------------------------
-def _traced_candidates(ink: np.ndarray, ls: int, min_ls: float = 1.6) -> list[np.ndarray]:
+def _traced_candidates(ink: np.ndarray, ls: int, min_ls: float = 1.6):
+    """Full-page masks of the long near-vertical strokes, yielded one at a time
+    so that only one candidate mask exists at once."""
     long_px = path_length(ink) >= min_ls * ls
     n, lab = cv2.connectedComponents(long_px.astype(np.uint8), connectivity=8)
-    return [lab == i for i in range(1, n)]
+    for i in range(1, n):
+        yield lab == i
 
 
 def _grow(seed: np.ndarray, ink: np.ndarray, ls: int) -> np.ndarray:
@@ -192,23 +204,46 @@ def _grow(seed: np.ndarray, ink: np.ndarray, ls: int) -> np.ndarray:
     return out
 
 
-def _merge_touching(masks: list[np.ndarray], ls: int) -> list[list[int]]:
-    """Group masks that overlap once stretched vertically by 0.2 LS."""
+def _touch(a: Region, b: Region, k: np.ndarray) -> bool:
+    """True if two regions overlap once both are dilated with kernel `k`.
+
+    The test is made in the smallest window that holds both regions plus the
+    kernel's reach, which gives the same answer as dilating full-page masks.
+    """
+    ry, rx = k.shape[0] // 2, k.shape[1] // 2
+    (ay, ax), (by, bx) = a.slices, b.slices
+    # dilated boxes that do not meet cannot overlap
+    if ay.start - ry > by.stop - 1 + ry or by.start - ry > ay.stop - 1 + ry:
+        return False
+    if ax.start - rx > bx.stop - 1 + rx or bx.start - rx > ax.stop - 1 + rx:
+        return False
+    h, w = a.page
+    y0, y1 = max(0, min(ay.start, by.start) - ry), min(h, max(ay.stop, by.stop) + ry)
+    x0, x1 = max(0, min(ax.start, bx.start) - rx), min(w, max(ax.stop, bx.stop) + rx)
+    fat = []
+    for r in (a, b):
+        win = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        win[r.y - y0 : r.y - y0 + r.crop.shape[0], r.x - x0 : r.x - x0 + r.crop.shape[1]] = r.crop
+        fat.append(cv2.dilate(win, k).astype(bool))
+    return bool((fat[0] & fat[1]).any())
+
+
+def _merge_touching(regions: list[Region], ls: int) -> list[list[int]]:
+    """Group regions that overlap once stretched vertically by 0.2 LS."""
     k = np.ones((int(0.4 * ls) | 1, 5), np.uint8)
-    fat = [cv2.dilate(m.astype(np.uint8), k).astype(bool) for m in masks]
-    parent = list(range(len(masks)))
+    parent = list(range(len(regions)))
 
     def find(a: int) -> int:
         while parent[a] != a:
             a = parent[a]
         return a
 
-    for i in range(len(masks)):
-        for j in range(i + 1, len(masks)):
-            if (fat[i] & fat[j]).any():
+    for i in range(len(regions)):
+        for j in range(i + 1, len(regions)):
+            if _touch(regions[i], regions[j], k):
                 parent[find(j)] = find(i)
     groups: dict[int, list[int]] = {}
-    for i in range(len(masks)):
+    for i in range(len(regions)):
         groups.setdefault(find(i), []).append(i)
     return list(groups.values())
 
@@ -396,18 +431,23 @@ def is_brace(f: dict, kind: str, arms: int = 1) -> bool:
 
 
 def detect_braces(ink: np.ndarray, ls: int, sw: float, debug: list | None = None) -> list[Brace]:
-    """Return all braces found in the ink mask."""
+    """Return all braces found in the ink mask.
+
+    `debug`, if given, receives (kind, accepted, features, mask crop, arms)
+    for every tall candidate. The mask is cropped to its bounding box, which
+    is all the shape check needs.
+    """
     found: list[Brace] = []
     taken = np.zeros_like(ink)
 
     for chain in _chain(_arm_primitives(ink, ls), ink, ls, sw):
         mask = np.zeros_like(ink)
         for p in chain:
-            mask |= p["mask"]
+            p["region"].stamp(mask)
         f = stroke_features(mask, ink, ls, sw)
         ok = is_brace(f, "stacked", len(chain))
         if debug is not None and f["height_ls"] >= 1.1:
-            debug.append(("stacked", ok, f, mask, len(chain)))
+            debug.append(("stacked", ok, f, Region.from_full(mask).crop, len(chain)))
         if ok:
             found.append(_make(mask, "stacked", len(chain), f))
             taken |= mask
@@ -418,19 +458,19 @@ def detect_braces(ink: np.ndarray, ls: int, sw: float, debug: list | None = None
         f = stroke_features(mask, ink, ls, sw)
         ok = is_brace(f, "traced")
         if debug is not None:
-            debug.append(("traced", ok, f, mask, 1))
+            debug.append(("traced", ok, f, Region.from_full(mask).crop, 1))
         if ok:
             found.append(_make(_grow(mask, ink, ls), "traced", 1, f))
 
     # two halves of one brace (split at the cusp) become one detection
     merged: list[Brace] = []
-    for group in _merge_touching([b.mask for b in found], ls):
+    for group in _merge_touching([b.region for b in found], ls):
         if len(group) == 1:
             merged.append(found[group[0]])
             continue
         mask = np.zeros_like(ink)
         for i in group:
-            mask |= found[i].mask
+            found[i].region.stamp(mask)
         first = found[group[0]]
         merged.append(_make(mask, first.kind, sum(found[i].arms for i in group),
                             stroke_features(mask, ink, ls, sw)))
@@ -444,6 +484,7 @@ def detect_braces(ink: np.ndarray, ls: int, sw: float, debug: list | None = None
 
 
 def _make(mask: np.ndarray, kind: str, arms: int, f: dict) -> Brace:
-    ys, xs = np.where(mask)
-    bbox = (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
-    return Brace(bbox, mask, kind, arms, f)
+    """A Brace from a full-page mask; only its bounding-box crop is kept."""
+    region = Region.from_full(mask)
+    h, w = region.crop.shape
+    return Brace((region.x, region.y, w, h), region, kind, arms, f)
