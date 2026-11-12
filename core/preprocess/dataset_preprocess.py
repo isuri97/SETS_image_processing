@@ -17,10 +17,13 @@ import pandas as pd
 # =========================================================================== #
 # CONFIG — edit these, then press Run
 # =========================================================================== #
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 INPUT_FILES = [
-    "/home/isuri/PycharmProjects/SETS_image_processing/core/preprocess/labels_result.csv",
-    "/home/isuri/PycharmProjects/SETS_image_processing/core/preprocess/symbols.csv",
+    SCRIPT_DIR / "labels_result.csv",
+    SCRIPT_DIR / "symbols.csv",
 ]
+
 OVERWRITE = False   # True: replace the original files; False: write <name>_clean.csv
 FORCE_SCHEMA = None  # None to auto-detect, or "annotator" / "symbol"
 # =========================================================================== #
