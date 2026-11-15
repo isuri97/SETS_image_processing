@@ -88,7 +88,8 @@ def symbol_rows(data: dict, page: str) -> list[dict]:
     columns = data.get("columns", [])
     width, height = data.get("image_size", ["", ""])
     page_info = {
-        "source_file": data.get("source_file", ""), "page": page,
+        "source_file": Path(data["source_file"]).name if data.get("source_file") else "",
+        "page": page,
         "image_width": width, "image_height": height, "sheet_x": dx, "sheet_y": dy,
         "line_spacing_px": data.get("line_spacing_px", ""), "stroke_width_px": data.get("stroke_width_px", ""),
         "run_date": data.get("run_date", ""),
