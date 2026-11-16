@@ -97,6 +97,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # find run.py and symb
 from run import process  # noqa: E402
 from symbol_csv import add_symbols, append_symbols, drop_pages, load_symbols, merge_symbols  # noqa: E402
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 MARK_KINDS = ("rule", "slash", "dash", "circle", "filler")
 COLUMNS = ["image", "status", "seconds", "marks_seconds", "words_seconds",
@@ -105,6 +107,19 @@ COLUMNS = ["image", "status", "seconds", "marks_seconds", "words_seconds",
 CROSS_COLUMNS = ["page_a", "page_b", "status", "seconds", "matches", "clusters", "error"]
 
 
+
+# --------------------------------------------------------------------------
+# Paths relative to this file, so the script runs on any machine
+# --------------------------------------------------------------------------
+
+def find_project_root(start: Path, marker: str = "core") -> Path:
+    """The nearest folder above `start` that contains `marker` (the project root)."""
+    for folder in (start, *start.parents):
+        if (folder / marker).is_dir():
+            return folder
+    raise SystemExit(f"Project root not found: no '{marker}' folder above {start}")
+
+PROJECT_ROOT = find_project_root(SCRIPT_DIR)  # .../SETS_image_processing
 # --------------------------------------------------------------------------
 # word-spotting module
 # --------------------------------------------------------------------------
@@ -764,9 +779,10 @@ def main() -> None:
 # (e.g. the Run button in PyCharm).
 # --------------------------------------------------------------------------
 SETTINGS = dict(
-    folder="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data/test",   # image folder
+    # folder="/home/isuri/PycharmProjects/SETS_image_processing/core/annotator/data2/data/test",   # image folder
+    folder=PROJECT_ROOT / "core" / "annotator" / "data2" / "data" / "test",  # image folder
     words=False,                                    # similar-word spotting per page
-    spotting_root="/home/isuri/PycharmProjects/SETS_image_processing",      # project root
+    spotting_root=PROJECT_ROOT,       # project root
     spotting_module="core.comparing_all_similar_words.in_between_comparison",
     # None = CrossParams() defaults of your module; a dict changes single fields, e.g.
     # dict(z_threshold=3.0, top_k_within=8) for more within-page matches (and more false ones)
